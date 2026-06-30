@@ -1,0 +1,19 @@
+[project]
+name = "solocoder-4-py"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Vincent.Y.K.JIANG",email = "vincent4502237@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pytest (>=9.0.3,<10.0.0)"
+]
+
+[tool.poetry]
+packages = [{include = "solocoder_4_py", from = "src"}]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
