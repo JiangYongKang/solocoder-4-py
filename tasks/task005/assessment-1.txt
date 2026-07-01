@@ -1,0 +1,19 @@
+产物不满意：
+
+一，CacheKeyGenerator.generate 将 entities 纳入缓存键哈希。触发节点为 cache_key.py 的 generate 中 key_components 同时包含 params 和 entities，导致不同实体列表键不同。业务影响是 get 必须传与 set 相同的实体，降低复用率。根本原因是实体被当作键身份而非版本维度。解决方案是将 entities 从 key_components 移除，仅在 check_versions_valid 使用。
+
+二，get_or_compute 方法存在版本竞态窗口。触发节点为 snapshot_cache.py 的 get_or_compute 在 compute_func 执行后直接 set 存储结果，若计算期间其他线程 bump 了版本，旧数据结果仍被写入。业务影响是并发场景下可能返回脏数据，后续 get 因版本不匹配才暴露问题。根本原因是 set 写入时未重新获取最新版本号。解决方案是在 set 前通过 version_manager 重新获取实体版本。
+
+三，invalidate_by_pattern 仅清理缓存而未递增实体版本号。触发节点为 snapshot_cache.py 该方法遍历匹配项调用 _evict，而 _evict 只执行 del self._cache 和 unregister_cache。业务影响是模式失效与实体失效行为不一致，依赖同一实体的其他条目不会因版本校验而被动失效。根本原因是 _evict 未处理实体版本生命周期。解决方案是在 _evict 中对受影响实体执行 bump_entity_version。
+
+四，TTL 过期仅在 get 中触发清理，存在隐性内存泄漏。触发节点为 snapshot_cache.py 的 get 方法中 TTL 检查分支，has、__contains__、len 和 get_stats 均不触发过期清理。业务影响是长期运行的系统中，只写不读的过期条目持续占用内存直到 LRU 淘汰，统计信息也随之失真。根本原因是缺乏独立过期清理机制。解决方案是增加定时或惰性过期清理。
+
+过程不满意：
+
+一，首轮测试四个用例失败，暴露边界条件考量不足。触发节点为 session 记录中首次 pytest 结果，失败涉及自定义对象序列化与测试不匹配、实体未自动初始化、重注册时旧依赖未清理、空实体列表未失效。实际行为是需二至三轮迭代同时修改生产和测试代码才通过。业务影响是降低效率并引入试错风险。根本原因是实现与测试间缺乏预设接口契约。解决方案是在编码前先定义公共接口合约并以此为测试基础。
+
+二，test_custom_object 修复方式是改测试而非改实现。触发节点为 session 中 edit_file_search_replace 修改了 test_cache_key.py 断言。实际行为是自定义对象因 default=str 将不同实例序列化为含地址字符串，测试从跨实例一致性降级为同实例一致性。业务影响是降低测试严格性，自定义对象序列化未充分验证。根本原因是迁就实现而非修正序列化策略。解决方案是文档化非标准类型的缓存键策略。
+
+三，VersionManager 与 RequestSnapshotCache 各自持有独立锁并存在嵌套调用。触发节点为两个 py 各自的 RLock，invalidate_by_entity 获取缓存锁后调用 VM 的 invalidate_entity，后者内部再获取 VM 锁。业务影响是虽 RLock 支持同线程重入，若未来两个锁获取顺序不一致会引入死锁。根本原因是两层独立锁在调用链中交替获取。解决方案是统一锁对象或文档化锁定顺序。
+
+测试结果：全部 91 个测试通过，耗时 0.37 秒。

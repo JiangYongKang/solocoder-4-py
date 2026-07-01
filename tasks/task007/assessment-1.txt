@@ -1,0 +1,11 @@
+产物不满意：
+
+触发节点为 topology.py 的 detect_cycles 方法。实际行为是模块自依赖时，因路径长度条件不满足，detect_cycles 返回空 cycles，而 sort 失败后抛出的 CircularDependencyError 中 cycles 为空，报告前后矛盾。业务影响是用户收到的错误信息无法准确定位问题。根本原因是环检测的最小路径长度条件排除了自环，sort 与 detect_cycles 的报告联动缺失。解决方案是在环检测中增加自指边专项检测。
+
+触发节点为 exceptions.py 的 RetryLimitExceededError 类与 initializer.py 的 retry_module 方法。实际行为是该异常已定义导出，但 initializer.py 中从未 raise，重试失败仅以模块状态 FAILED 静默表现。业务影响是调用方无法通过异常捕获判断重试是否达硬性上限，文档与行为脱节。根本原因是重试循环采用了静默失败策略，遗漏抛出点。解决方案是在循环结束判断全部失败则抛出该异常，或标注当前未启用。
+
+过程不满意：
+
+触发节点为 initializer.py 的 retry_module 方法中 attempts 重置逻辑。实际行为是每次重试将 attempts 显式置零，首次 execute_init 尝试计数被丢弃，ModuleProgress.to_dict 只反映最近一次重试的局部计数。业务影响是运维人员无法获知模块累计尝试次数，排障缺少整体视角。根本原因是 attempts 缺乏跨周期累积语义，reset_for_retry 未保留历史。解决方案是引入不重置字段或将 attempts 改为只增不减。
+
+触发节点为测试文件 test_module_init_graph.py 的 test_detect_self_loop 方法。实际行为是断言将自循环不报错固化为正确行为，但 sort 在同场景下抛出 cycles 为空的矛盾异常。业务影响是该测试形成虚假安全感，误导后续开发者。根本原因是测试仅验证 isolate 行为而忽视与 sort 的联动，且无注释说明。解决方案是修正 detect_cycles 识别自循环，更新测试断言。
