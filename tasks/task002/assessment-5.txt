@@ -1,0 +1,5 @@
+产物不满意：
+1. 方法名 _resolve_loader_backfill_ttls 仍然具有误导性，未按第4轮建议更名为通用名称（如 _resolve_ttls）。当前该方法被三处调用：get()（第487行，loader回填场景）、get_with_level()（第586行，loader回填场景）、set()（第627行，主动写入场景）。方法名中的 loader_backfill 暗示仅用于 loader/回填场景，但 set() 是纯主动写入操作，与 loader 回填完全无关。业务影响：未来维护者在阅读 set() 代码时会困惑——"为什么主动写入要调用一个 loader 回填专用的 TTL 解析方法？"——从而可能误判该方法不再适用于 set() 场景并另写一份 TTL 解析逻辑，导致重复代码再次出现。解决方案：将方法名从 _resolve_loader_backfill_ttls 重命名为 _resolve_ttls（或 _resolve_effective_ttls），因为其逻辑本质是通用的 shared_ttl/local_ttl > ttl > _UNSET 优先级解析，与调用场景无关。
+
+过程不满意：
+无

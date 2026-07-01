@@ -395,16 +395,30 @@ class LayeredCache:
         tags: Iterable[str],
         effective_local_ttl: object,
         effective_shared_ttl: object,
+        write_local: bool = True,
+        write_shared: bool = True,
     ) -> None:
-        """同时写入本地和共享缓存"""
-        if effective_shared_ttl is _UNSET:
-            self._shared.set(key=key, value=value, tags=tags)
-        else:
-            self._shared.set(key=key, value=value, tags=tags, ttl=effective_shared_ttl)
-        if effective_local_ttl is _UNSET:
-            self._local.set(key=key, value=value, tags=tags)
-        else:
-            self._local.set(key=key, value=value, tags=tags, ttl=effective_local_ttl)
+        """写入本地和/或共享缓存
+
+        Args:
+            key: 缓存键
+            value: 缓存值
+            tags: 标签列表
+            effective_local_ttl: 解析后的本地 TTL 或 _UNSET
+            effective_shared_ttl: 解析后的共享 TTL 或 _UNSET
+            write_local: 是否写入本地缓存
+            write_shared: 是否写入共享缓存
+        """
+        if write_shared:
+            if effective_shared_ttl is _UNSET:
+                self._shared.set(key=key, value=value, tags=tags)
+            else:
+                self._shared.set(key=key, value=value, tags=tags, ttl=effective_shared_ttl)
+        if write_local:
+            if effective_local_ttl is _UNSET:
+                self._local.set(key=key, value=value, tags=tags)
+            else:
+                self._local.set(key=key, value=value, tags=tags, ttl=effective_local_ttl)
 
     # ------------------------------------------------------------
     # 核心：读穿透访问
@@ -610,48 +624,18 @@ class LayeredCache:
         with self._lock:
             tag_list = list(tags) if tags is not None else []
 
-            if shared_ttl is not _UNSET:
-                effective_shared_ttl = shared_ttl
-            elif ttl is not _UNSET:
-                effective_shared_ttl = ttl
-            else:
-                effective_shared_ttl = _UNSET
-
-            if local_ttl is not _UNSET:
-                effective_local_ttl = local_ttl
-            elif ttl is not _UNSET:
-                effective_local_ttl = ttl
-            else:
-                effective_local_ttl = _UNSET
-
-            if write_shared:
-                if effective_shared_ttl is _UNSET:
-                    self._shared.set(
-                        key=key,
-                        value=value,
-                        tags=tag_list,
-                    )
-                else:
-                    self._shared.set(
-                        key=key,
-                        value=value,
-                        tags=tag_list,
-                        ttl=effective_shared_ttl,
-                    )
-            if write_local:
-                if effective_local_ttl is _UNSET:
-                    self._local.set(
-                        key=key,
-                        value=value,
-                        tags=tag_list,
-                    )
-                else:
-                    self._local.set(
-                        key=key,
-                        value=value,
-                        tags=tag_list,
-                        ttl=effective_local_ttl,
-                    )
+            effective_local_ttl, effective_shared_ttl = self._resolve_loader_backfill_ttls(
+                ttl, local_ttl, shared_ttl
+            )
+            self._set_both_levels(
+                key=key,
+                value=value,
+                tags=tag_list,
+                effective_local_ttl=effective_local_ttl,
+                effective_shared_ttl=effective_shared_ttl,
+                write_local=write_local,
+                write_shared=write_shared,
+            )
 
     def set_local(
         self,
