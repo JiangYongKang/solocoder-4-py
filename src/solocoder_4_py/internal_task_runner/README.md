@@ -280,18 +280,63 @@ handler 不会被调用，统计数据仍然一致。
 ### definition_snapshot 的一致性意义
 
 除了终态防护，**快照**还解决了"handler 动态替换期间的不一致"问题：
-如果在 handler 执行过程中（另一个线程）替换了 `info.definition.handler`，
+如果在 handler 执行过程中（另一个线程）通过 `set_task_handler()` 替换了任务执行逻辑，
 本次运行仍然使用入口处读取的 `definition_snapshot`，避免中途切换逻辑。
 
 测试代码可以通过下面模式验证：
 
 ```python
 # 在 handler 阻塞期间替换
-info = runner.get_task("mid")
-info.definition.handler = lambda **kw: "injected"
+runner.set_task_handler("mid", lambda **kw: "injected")
 # 但运行结果仍然是阻塞 handler 的返回值
 assert result.result == "blocking-result"
 ```
+
+## 动态 Handler 替换
+
+任务注册后，执行逻辑可能需要根据业务场景动态调整（例如故障降级、策略切换、热修复等）。
+`InternalTaskRunner` 提供线程安全的 `set_task_handler()` 公共 API，避免直接操作内部数据结构。
+
+### 基本用法
+
+```python
+# 注册时使用初始 handler
+runner.register(TaskDefinition(
+    task_id="payment",
+    task_type=TaskType.MANUAL,
+    handler=original_payment_flow,
+))
+runner.activate("payment")
+
+# 后续需要切换到新的执行逻辑
+runner.set_task_handler("payment", new_payment_flow)
+
+# 后续 trigger 将使用 new_payment_flow
+rec = runner.trigger("payment")
+```
+
+### 与 definition_snapshot 的交互
+
+`set_task_handler()` 直接修改 `TaskDefinition.handler`，但由于 `_execute_single_run`
+在**入口处锁内生成 `definition_snapshot`**，二者配合产生以下行为：
+
+| 替换时机 | 对本次运行的影响 | 对后续运行的影响 |
+|---------|------------------|------------------|
+| 运行前（handler 尚未开始） | 使用新 handler | 使用新 handler |
+| 运行中（handler 已在执行） | 仍使用快照的旧 handler | 使用新 handler |
+| 运行后 | — | 使用新 handler |
+
+这意味着：**正在飞行中的运行不会被中途替换逻辑**，保证了单次执行的一致性。
+如果需要让新逻辑立即生效，必须等待当前运行结束或取消任务后重新触发。
+
+### 线程安全
+
+`set_task_handler()` 内部持 `RLock` 保护，与 `tick()`、`trigger()`、`cancel()`
+等操作互斥，不会出现"读到半个 handler"的情况。
+
+**注意**：`set_task_handler()` 只替换 `handler` 字段，不修改其他调度参数
+（`timeout_seconds`、`retry_delay_seconds`、`interval_seconds` 等）。如果需要整体替换任务定义，
+请先 `unregister()` 再重新 `register()`。
 
 ---
 

@@ -1,0 +1,4 @@
+你实现的事务协调功能模块存在以下问题，需要修复：
+1. _execute_abort_with_retry 方法（coordinator.py）使用 except Exception: pass 捕获所有异常，但 abort_transaction 方法的状态校验路径可能抛出 TransactionStateError。当 abort 因非法状态转移失败时，该异常被静默吞掉，调用方无法感知 abort 失败。
+2. commit_transaction 方法（coordinator.py）构建 CommitFailedError 异常消息时，从 ctx.errors 列表末尾按偏移量切片提取 commit 失败详情，依赖 commit 阶段错误排在数组末尾的隐式假设。如果 prepare 阶段也有错误记录被写入 ctx.errors，commit 异常消息中会混入不相关的 prepare 错误信息。
+3. 重新运行 poetry run pytest tests/transaction_coordination/ -q，需要让所有测试通过。

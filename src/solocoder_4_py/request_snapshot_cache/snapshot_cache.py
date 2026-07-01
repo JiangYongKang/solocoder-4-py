@@ -49,11 +49,6 @@ class RequestSnapshotCache:
         }
 
     def _cleanup_expired(self) -> int:
-        if self._default_ttl is None and not any(
-            entry.ttl is not None for entry in self._cache.values()
-        ):
-            return 0
-
         now = time.time()
         expired_keys: List[str] = []
 

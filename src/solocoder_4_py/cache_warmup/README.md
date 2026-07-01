@@ -348,7 +348,7 @@ print(prog_dict["tasks"]["item-0"]["loaded_data_preview"])
 | `WarmupStateError` | 非法状态转换（如已开始执行后再注册任务） |
 | `TaskNotFoundError` | 查询不存在的 run_id 或 task_id |
 
-## 8. 文件结构
+## 6. 文件结构
 
 ```
 src/solocoder_4_py/cache_warmup/
@@ -366,7 +366,7 @@ tests/cache_warmup/
 └── test_cache_warmup.py # 完整单元测试
 ```
 
-## 9. 运行测试
+## 7. 运行测试
 
 ```bash
 python -m pytest tests/cache_warmup/ -v

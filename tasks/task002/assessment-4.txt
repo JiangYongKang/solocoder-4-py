@@ -1,0 +1,5 @@
+产物不满意：
+1. `set` 方法的 TTL 解析逻辑未被一并重构。`_resolve_loader_backfill_ttls` 辅助方法（layered_cache.py 第365-389行）与 `set` 方法体内联的 TTL 解析逻辑（第613-625行）功能完全一致——两者均按 `shared_ttl/local_ttl > ttl > _UNSET` 的优先级解析 effective_ttl。但本轮重构仅用该辅助方法替换了 `get`（第473行）和 `get_with_level`（第572行）中的重复代码，`set` 方法中的 13 行 TTL 解析逻辑（第613-625行）被遗留为第三份独立副本。业务影响：当 TTL 优先级规则需要调整时（例如引入新的 TTL 参数层级），修改者需要同步修改 `_resolve_loader_backfill_ttls` 和 `set` 方法两处，原提示词所述的"任何不一致都会导致不同方法对同一调用场景返回不同的过期时间"风险并未完全消除。根因分析：模型在消除重复代码时仅关注了提示词明确提到的 `get` 和 `get_with_level` 两个方法，未进行全局搜索以确认是否还有其他位置存在同一段 TTL 解析逻辑。解决方案：将 `set` 方法第613-625行的 TTL 解析逻辑替换为 `effective_local_ttl, effective_shared_ttl = self._resolve_loader_backfill_ttls(ttl, local_ttl, shared_ttl)`，并将辅助方法名从 `_resolve_loader_backfill_ttls` 改为更通用的名称（如 `_resolve_ttls`），因为其逻辑本质是通用的 TTL 优先级解析，与 loader 回填场景无关。
+
+过程不满意：
+无

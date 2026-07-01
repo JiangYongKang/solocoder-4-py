@@ -1,0 +1,4 @@
+你实现的分层缓存功能模块存在以下问题，需要修复：
+1. set_local 和 set_shared 方法（layered_cache.py）的 ttl 参数默认值为 None，而 get、set、get_with_level 等方法的 ttl 参数已统一使用 _UNSET 哨兵值。调用 set_local("k", "v") 不传 ttl 时，None 跳过 default_ttl 回退逻辑，导致条目被设为永不过期，与其他方法的 TTL 默认语义不一致。
+2. get 和 get_with_level 方法（layered_cache.py）中处理共享缓存命中回填和 loader 回填的 TTL 优先级解析逻辑存在两份完全重复的代码块。当 TTL 规则需要调整时，两处必须同步修改，任何不一致都会导致两个方法对同一调用场景返回不同的过期时间。
+3. 重新运行 poetry run pytest tests/layered_cache/ -q，需要让所有测试通过。

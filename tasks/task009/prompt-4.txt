@@ -1,0 +1,3 @@
+你实现的内部任务运行器功能模块存在以下问题，需要修复：
+1. README.md 的触发器竞态防护章节中，代码示例使用了 info.definition.handler = ... 直接字段赋值来替换 handler，该操作绕过 set_task_handler 公共方法的锁保护机制，若用户在并发场景下参照该示例实现，可能导致竞态条件。
+2. 重新运行 poetry run pytest tests/internal_task_runner/ -q，需要让所有测试通过。

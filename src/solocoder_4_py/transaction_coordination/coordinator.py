@@ -275,24 +275,29 @@ class TransactionCoordinator:
                 ctx.final_decision_made = True
                 ctx.decision = TransactionState.COMMITTED
 
-        all_success = self._do_commit_participants(tx_id, list(ctx.participants_order))
+        all_success, commit_errors = self._do_commit_participants(tx_id, list(ctx.participants_order))
 
         with self._lock:
             ctx = self._transactions[tx_id]
             if not all_success:
-                error_details = "; ".join(ctx.errors[-len(ctx.commit_failed_participants) :])
+                error_details = "; ".join(commit_errors)
                 raise CommitFailedError(
                     message=f"事务 {tx_id} 部分参与者 commit 失败：{error_details}，需调用 retry_commit() 重试",
                     failed_participants=sorted(ctx.commit_failed_participants),
                     committed_participants=sorted(ctx.committed_participants),
                 )
 
-    def _do_commit_participants(self, tx_id: str, pids_to_commit: List[str]) -> bool:
+    def _do_commit_participants(
+        self, tx_id: str, pids_to_commit: List[str]
+    ) -> tuple[bool, List[str]]:
         """执行具体的参与者 commit 操作
 
-        :returns: True 表示所有指定参与者均 commit 成功；False 表示存在失败
+        :returns: (all_success, error_messages)
+                  all_success: True 表示所有指定参与者均 commit 成功
+                  error_messages: 本次 commit 阶段产生的错误消息列表
         """
         all_success = True
+        error_messages: List[str] = []
         for pid in pids_to_commit:
             with self._lock:
                 ctx = self._transactions[tx_id]
@@ -308,10 +313,12 @@ class TransactionCoordinator:
                     ctx.commit_failed_participants.discard(pid)
             except Exception as exc:
                 all_success = False
+                msg = f"参与者 {pid} commit 失败：{exc}"
+                error_messages.append(msg)
                 with self._lock:
                     ctx = self._transactions[tx_id]
                     ctx.commit_failed_participants.add(pid)
-                    ctx.errors.append(f"参与者 {pid} commit 失败：{exc}")
+                    ctx.errors.append(msg)
 
         with self._lock:
             ctx = self._transactions[tx_id]
@@ -324,7 +331,7 @@ class TransactionCoordinator:
                 else:
                     ctx.state = TransactionState.COMMIT_PARTIALLY_FAILED
 
-        return all_success
+        return all_success, error_messages
 
     def retry_commit(self, tx_id: str) -> bool:
         """重试 commit 那些之前失败的参与者
@@ -352,7 +359,8 @@ class TransactionCoordinator:
                     ctx.state = TransactionState.COMMITTED
                 return True
 
-        return self._do_commit_participants(tx_id, failed_pids)
+        success, _ = self._do_commit_participants(tx_id, failed_pids)
+        return success
 
     def has_incomplete_commit(self, tx_id: str) -> bool:
         """查询是否存在未成功 commit 的参与者"""
@@ -537,11 +545,20 @@ class TransactionCoordinator:
         return self.get_transaction_state(tx_id)
 
     def _execute_abort_with_retry(self, tx_id: str) -> None:
-        """执行 abort 并在失败时自动重试，若最终仍失败则抛 AbortFailedError"""
-        try:
-            self.abort_transaction(tx_id)
-        except Exception:
-            pass  # abort_transaction 自身不抛异常，但可能有失败参与者
+        """执行 abort 并在失败时自动重试，若最终仍失败则抛 AbortFailedError
+
+        注意：abort_transaction 在状态校验失败时会抛 TransactionStateError，
+        此类异常直接向上传播，不被本方法捕获。
+        """
+        # abort_transaction 自身在状态非法时会抛 TransactionStateError，直接向上传播
+        # 只有参与者回调失败时不抛异常但会标记 abort_failed_participants
+        self.abort_transaction(tx_id)
+
+        # 如果还存在失败参与者则重试
+        with self._lock:
+            ctx = self._transactions[tx_id]
+            if not ctx.abort_failed_participants:
+                return
 
         success = self._retry_with_limit(tx_id, self.retry_abort)
         if not success:

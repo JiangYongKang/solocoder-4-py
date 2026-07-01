@@ -368,29 +368,6 @@ result4 = guard2.get("slow_key")
 print(result4)  # "timeout_fallback"
 ```
 
-### 自定义 TTL 续期
-
-```python
-# 短 TTL 条目，续期时保持短 TTL
-guard.set("volatile_data", "value", ttl=10)  # 10秒 TTL
-
-# 访问多次成为热点键
-for _ in range(15):
-    guard.get("volatile_data")
-
-# 后台续期时会继承 10 秒 TTL，而非使用默认 300 秒
-entry = guard.get_entry("volatile_data")
-print(entry.original_ttl)  # 10
-
-# 长 TTL 条目
-guard.set("permanent_data", "value", ttl=3600)  # 1小时 TTL
-for _ in range(15):
-    guard.get("permanent_data")
-
-entry2 = guard.get_entry("permanent_data")
-print(entry2.original_ttl)  # 3600
-```
-
 ### 按标签批量失效
 
 ```python

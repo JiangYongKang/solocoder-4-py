@@ -1,0 +1,3 @@
+你实现的请求结果快照缓存功能模块存在以下问题，需要修复：
+1. _cleanup_expired 方法（snapshot_cache.py）在主遍历循环之前先执行 any(entry.ttl is not None for entry in ...) 预检查。当没有任何条目设置 per-entry TTL 时，预检查仍对全部条目做完整遍历后判定无需清理；当有条目需要清理时，预检查遍历全部条目后主循环又遍历第二遍，同一次 _cleanup_expired 调用中对所有条目执行了两次全量扫描。
+2. 重新运行 poetry run pytest tests/request_snapshot_cache/ -q，需要让所有测试通过。

@@ -341,6 +341,72 @@ class LayeredCache:
         self._request_stats = CacheStats()
 
     # ------------------------------------------------------------
+    # 内部辅助方法
+    # ------------------------------------------------------------
+    def _resolve_shared_hit_backfill_ttl(
+        self,
+        shared_entry: CacheEntry,
+        ttl: Optional[float],
+        local_ttl: Optional[float],
+    ) -> Optional[float]:
+        """解析共享缓存命中回填本地时的 TTL
+
+        优先级：local_ttl > 统一 ttl > 共享条目 remaining_ttl > 共享永不过期
+        """
+        if local_ttl is not _UNSET:
+            return local_ttl
+        elif ttl is not _UNSET:
+            return ttl
+        elif shared_entry.expires_at is not None:
+            return max(0.0, shared_entry.remaining_ttl())
+        else:
+            return None
+
+    def _resolve_loader_backfill_ttls(
+        self,
+        ttl: Optional[float],
+        local_ttl: Optional[float],
+        shared_ttl: Optional[float],
+    ) -> Tuple[object, object]:
+        """解析 loader 回填时的 TTL，返回 (effective_local_ttl, effective_shared_ttl)
+
+        优先级：local_ttl/shared_ttl > 统一 ttl > _UNSET（使用各层 default_ttl）
+        """
+        if shared_ttl is not _UNSET:
+            effective_shared_ttl = shared_ttl
+        elif ttl is not _UNSET:
+            effective_shared_ttl = ttl
+        else:
+            effective_shared_ttl = _UNSET
+
+        if local_ttl is not _UNSET:
+            effective_local_ttl = local_ttl
+        elif ttl is not _UNSET:
+            effective_local_ttl = ttl
+        else:
+            effective_local_ttl = _UNSET
+
+        return effective_local_ttl, effective_shared_ttl
+
+    def _set_both_levels(
+        self,
+        key: str,
+        value: Any,
+        tags: Iterable[str],
+        effective_local_ttl: object,
+        effective_shared_ttl: object,
+    ) -> None:
+        """同时写入本地和共享缓存"""
+        if effective_shared_ttl is _UNSET:
+            self._shared.set(key=key, value=value, tags=tags)
+        else:
+            self._shared.set(key=key, value=value, tags=tags, ttl=effective_shared_ttl)
+        if effective_local_ttl is _UNSET:
+            self._local.set(key=key, value=value, tags=tags)
+        else:
+            self._local.set(key=key, value=value, tags=tags, ttl=effective_local_ttl)
+
+    # ------------------------------------------------------------
     # 核心：读穿透访问
     # ------------------------------------------------------------
     def get(
@@ -377,15 +443,9 @@ class LayeredCache:
             if shared_entry is not None:
                 self._request_stats.hits += 1
 
-                if local_ttl is not _UNSET:
-                    effective_local_ttl = local_ttl
-                elif ttl is not _UNSET:
-                    effective_local_ttl = ttl
-                elif shared_entry.expires_at is not None:
-                    effective_local_ttl = max(0.0, shared_entry.remaining_ttl())
-                else:
-                    effective_local_ttl = None
-
+                effective_local_ttl = self._resolve_shared_hit_backfill_ttl(
+                    shared_entry, ttl, local_ttl
+                )
                 self._local.set(
                     key=key,
                     value=shared_entry.value,
@@ -410,46 +470,16 @@ class LayeredCache:
             self._request_stats.loader_calls += 1
             effective_tags = list(tags) if tags is not None else []
 
-            if shared_ttl is not _UNSET:
-                effective_shared_ttl = shared_ttl
-            elif ttl is not _UNSET:
-                effective_shared_ttl = ttl
-            else:
-                effective_shared_ttl = _UNSET
-
-            if local_ttl is not _UNSET:
-                effective_local_ttl = local_ttl
-            elif ttl is not _UNSET:
-                effective_local_ttl = ttl
-            else:
-                effective_local_ttl = _UNSET
-
-            if effective_shared_ttl is _UNSET:
-                self._shared.set(
-                    key=key,
-                    value=loaded_value,
-                    tags=effective_tags,
-                )
-            else:
-                self._shared.set(
-                    key=key,
-                    value=loaded_value,
-                    tags=effective_tags,
-                    ttl=effective_shared_ttl,
-                )
-            if effective_local_ttl is _UNSET:
-                self._local.set(
-                    key=key,
-                    value=loaded_value,
-                    tags=effective_tags,
-                )
-            else:
-                self._local.set(
-                    key=key,
-                    value=loaded_value,
-                    tags=effective_tags,
-                    ttl=effective_local_ttl,
-                )
+            effective_local_ttl, effective_shared_ttl = self._resolve_loader_backfill_ttls(
+                ttl, local_ttl, shared_ttl
+            )
+            self._set_both_levels(
+                key=key,
+                value=loaded_value,
+                tags=effective_tags,
+                effective_local_ttl=effective_local_ttl,
+                effective_shared_ttl=effective_shared_ttl,
+            )
             return loaded_value
 
     def get_or_load(
@@ -512,15 +542,9 @@ class LayeredCache:
             if shared_entry is not None:
                 self._request_stats.hits += 1
 
-                if local_ttl is not _UNSET:
-                    effective_local_ttl = local_ttl
-                elif ttl is not _UNSET:
-                    effective_local_ttl = ttl
-                elif shared_entry.expires_at is not None:
-                    effective_local_ttl = max(0.0, shared_entry.remaining_ttl())
-                else:
-                    effective_local_ttl = None
-
+                effective_local_ttl = self._resolve_shared_hit_backfill_ttl(
+                    shared_entry, ttl, local_ttl
+                )
                 self._local.set(
                     key=key,
                     value=shared_entry.value,
@@ -545,46 +569,16 @@ class LayeredCache:
             self._request_stats.loader_calls += 1
             effective_tags = list(tags) if tags is not None else []
 
-            if shared_ttl is not _UNSET:
-                effective_shared_ttl = shared_ttl
-            elif ttl is not _UNSET:
-                effective_shared_ttl = ttl
-            else:
-                effective_shared_ttl = _UNSET
-
-            if local_ttl is not _UNSET:
-                effective_local_ttl = local_ttl
-            elif ttl is not _UNSET:
-                effective_local_ttl = ttl
-            else:
-                effective_local_ttl = _UNSET
-
-            if effective_shared_ttl is _UNSET:
-                self._shared.set(
-                    key=key,
-                    value=loaded_value,
-                    tags=effective_tags,
-                )
-            else:
-                self._shared.set(
-                    key=key,
-                    value=loaded_value,
-                    tags=effective_tags,
-                    ttl=effective_shared_ttl,
-                )
-            if effective_local_ttl is _UNSET:
-                self._local.set(
-                    key=key,
-                    value=loaded_value,
-                    tags=effective_tags,
-                )
-            else:
-                self._local.set(
-                    key=key,
-                    value=loaded_value,
-                    tags=effective_tags,
-                    ttl=effective_local_ttl,
-                )
+            effective_local_ttl, effective_shared_ttl = self._resolve_loader_backfill_ttls(
+                ttl, local_ttl, shared_ttl
+            )
+            self._set_both_levels(
+                key=key,
+                value=loaded_value,
+                tags=effective_tags,
+                effective_local_ttl=effective_local_ttl,
+                effective_shared_ttl=effective_shared_ttl,
+            )
             return loaded_value, CacheLevel.SOURCE
 
     # ------------------------------------------------------------
@@ -664,20 +658,40 @@ class LayeredCache:
         key: str,
         value: Any,
         tags: Optional[Iterable[str]] = None,
-        ttl: Optional[float] = None,
+        ttl: Optional[float] = _UNSET,
     ) -> None:
-        """仅写入本地缓存"""
-        self._local.set(key=key, value=value, tags=tags, ttl=ttl)
+        """仅写入本地缓存
+
+        Args:
+            key: 缓存键
+            value: 缓存值
+            tags: 标签列表
+            ttl: 过期时间（秒）。None 表示永不过期；不传则使用本地默认 TTL
+        """
+        if ttl is _UNSET:
+            self._local.set(key=key, value=value, tags=tags)
+        else:
+            self._local.set(key=key, value=value, tags=tags, ttl=ttl)
 
     def set_shared(
         self,
         key: str,
         value: Any,
         tags: Optional[Iterable[str]] = None,
-        ttl: Optional[float] = None,
+        ttl: Optional[float] = _UNSET,
     ) -> None:
-        """仅写入共享缓存"""
-        self._shared.set(key=key, value=value, tags=tags, ttl=ttl)
+        """仅写入共享缓存
+
+        Args:
+            key: 缓存键
+            value: 缓存值
+            tags: 标签列表
+            ttl: 过期时间（秒）。None 表示永不过期；不传则使用共享默认 TTL
+        """
+        if ttl is _UNSET:
+            self._shared.set(key=key, value=value, tags=tags)
+        else:
+            self._shared.set(key=key, value=value, tags=tags, ttl=ttl)
 
     # ------------------------------------------------------------
     # 失效操作（写后失效核心）

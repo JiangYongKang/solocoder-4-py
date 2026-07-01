@@ -1,0 +1,3 @@
+你实现的缓存雪崩防护功能模块存在以下问题，需要修复：
+1. README.md 的"使用示例"章节中包含了一段"自定义 TTL 续期"的说明与代码示例，该内容不属于当前需要修复的范围。
+2. 重新运行 poetry run pytest tests/cache_avalanche_guard/ -q，需要让所有测试通过。
