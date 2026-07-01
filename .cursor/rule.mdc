@@ -1,5 +1,6 @@
 ---
 alwaysApply: true
+description: 所有 Agent 与 Sub-Agent 必须完全遵守的规则，不可简化或省略任何细节。
 ---
 
 项目目标
