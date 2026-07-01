@@ -199,3 +199,39 @@ class TestCacheEntry:
         entry = CacheEntry(key="k", value="v", access_timestamps=timestamps)
         timestamps.append(3.0)
         assert entry.access_timestamps == [1.0, 2.0]
+
+    def test_original_ttl_default(self):
+        entry = CacheEntry(key="k", value="v")
+        assert entry.original_ttl is None
+
+    def test_original_ttl_set(self):
+        entry = CacheEntry(key="k", value="v", original_ttl=60)
+        assert entry.original_ttl == 60
+
+    def test_mark_rebuilt_with_original_ttl(self):
+        entry = CacheEntry(key="k", value="old")
+        new_expires_at = time.time() + 300
+        entry.mark_rebuilt(value="new", expires_at=new_expires_at, original_ttl=300)
+        assert entry.original_ttl == 300
+        assert entry.value == "new"
+
+    def test_mark_rebuilt_without_original_ttl(self):
+        entry = CacheEntry(key="k", value="old", original_ttl=60)
+        new_expires_at = time.time() + 300
+        entry.mark_rebuilt(value="new", expires_at=new_expires_at)
+        assert entry.original_ttl == 60
+
+    def test_to_dict_includes_original_ttl(self):
+        entry = CacheEntry(key="k", value="v", original_ttl=120)
+        data = entry.to_dict()
+        assert "original_ttl" in data
+        assert data["original_ttl"] == 120
+
+    def test_from_dict_restores_original_ttl(self):
+        data = {
+            "key": "k",
+            "value": "v",
+            "original_ttl": 180,
+        }
+        entry = CacheEntry.from_dict(data)
+        assert entry.original_ttl == 180

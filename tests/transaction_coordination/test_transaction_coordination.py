@@ -9,6 +9,7 @@ from solocoder_4_py.transaction_coordination import (
     PrepareFailedError,
     TERMINAL_PARTICIPANT_STATES,
     TERMINAL_TRANSACTION_STATES,
+    TimeoutDecisionAbortedError,
     TransactionCoordinator,
     TransactionError,
     TransactionNotFoundError,
@@ -480,9 +481,10 @@ class TestCoordinatorTimeout:
         tx_id = coord.begin_transaction()
         coord.register_participant(tx_id, p)
 
-        assert coord.prepare_transaction(tx_id) is False
+        with pytest.raises(TimeoutDecisionAbortedError):
+            coord.prepare_transaction(tx_id)
         final = coord.execute_transaction(tx_id)
-        assert final == TransactionState.ABORTED
+        assert final == TransactionState.TIMEOUT_ABORTED
         assert tracker.abort_calls[tx_id] == 1
 
     def test_prepare_before_timeout_succeeds(self) -> None:
@@ -697,3 +699,278 @@ class TestIntegrationScenarios:
         assert issubclass(TransactionStateError, TransactionError)
         assert issubclass(PrepareFailedError, TransactionError)
         assert issubclass(CommitFailedError, TransactionError)
+
+
+# ---------------------------------------------------------------------------
+# Bug fixes & new features (part of the fix for reported issues)
+# ---------------------------------------------------------------------------
+class TestTimeoutExceptionRaised:
+    """问题1修复：prepare_transaction 应真正抛出 TimeoutDecisionAbortedError"""
+
+    def test_prepare_transaction_throws_timeout_exception(self) -> None:
+        clock = FakeClock()
+        coord = TransactionCoordinator(prepare_timeout_seconds=5.0, clock=clock)
+        tracker = CallTracker()
+
+        def slow_prepare(tx_id: str) -> bool:
+            clock.advance(10.0)
+            return True
+
+        p = TransactionParticipant("slow")
+        p.set_callbacks(on_prepare=slow_prepare, on_abort=tracker.abort)
+
+        tx_id = coord.begin_transaction()
+        coord.register_participant(tx_id, p)
+
+        with pytest.raises(TimeoutDecisionAbortedError) as excinfo:
+            coord.prepare_transaction(tx_id)
+
+        assert "超时" in str(excinfo.value)
+        assert coord.get_transaction_state(tx_id) == TransactionState.ABORTING
+        # 执行 abort
+        coord.abort_transaction(tx_id)
+        # 由于超时分支设置了 decision = TIMEOUT_ABORTED，需要用 retry_abort 确保完成
+        if coord.has_incomplete_abort(tx_id):
+            coord.retry_abort(tx_id)
+        final_state = coord.get_transaction_state(tx_id)
+        assert final_state in (
+            TransactionState.ABORTED,
+            TransactionState.TIMEOUT_ABORTED,
+        )
+
+    def test_execute_transaction_handles_timeout(self) -> None:
+        """execute_transaction 能正确捕获 TimeoutDecisionAbortedError 并执行 abort"""
+        clock = FakeClock()
+        coord = TransactionCoordinator(prepare_timeout_seconds=5.0, clock=clock)
+
+        def slow_prepare(tx_id: str) -> bool:
+            clock.advance(100.0)
+            return True
+
+        p = TransactionParticipant("slow-svc")
+        p.set_callbacks(on_prepare=slow_prepare)
+
+        tx_id = coord.begin_transaction()
+        coord.register_participant(tx_id, p)
+
+        state = coord.execute_transaction(tx_id)
+        # execute_transaction 捕获超时并调用 abort_transaction
+        assert state == TransactionState.TIMEOUT_ABORTED
+
+
+class TestCommitPartialFailure:
+    """问题2修复：commit 部分失败应抛 CommitFailedError，execute_transaction 不静默吞掉"""
+
+    def test_commit_partial_failure_throws_commit_failed_error(self) -> None:
+        coord = TransactionCoordinator()
+        t1 = CallTracker()
+        t2 = CallTracker()
+
+        p_good = TransactionParticipant("good")
+        p_good.set_callbacks(
+            on_prepare=t1.prepare,
+            on_commit=t1.commit,
+            on_abort=t1.abort,
+        )
+
+        p_bad = TransactionParticipant("bad")
+        p_bad.set_callbacks(
+            on_prepare=lambda tx: True,
+            on_commit=lambda tx: (_ for _ in ()).throw(RuntimeError("db crashed")),
+            on_abort=t2.abort,
+        )
+
+        tx_id = coord.begin_transaction()
+        coord.register_participant(tx_id, p_good)
+        coord.register_participant(tx_id, p_bad)
+
+        assert coord.prepare_transaction(tx_id) is True
+
+        with pytest.raises(CommitFailedError) as excinfo:
+            coord.commit_transaction(tx_id)
+
+        # 虽然失败了，但协调器决策仍是 COMMITTED（2PC 语义）
+        assert "db crashed" in str(excinfo.value)
+        assert coord.get_transaction_state(tx_id) == TransactionState.COMMITTED
+        # good 参与者已提交
+        assert p_good.get_state(tx_id) == ParticipantState.COMMITTED
+
+    def test_execute_transaction_propagates_commit_failure(self) -> None:
+        """execute_transaction 不应静默吞掉 CommitFailedError"""
+        coord = TransactionCoordinator()
+        p_good = TransactionParticipant("good")
+        p_good.set_callbacks(on_prepare=lambda tx: True, on_commit=lambda tx: None)
+        p_bad = TransactionParticipant("bad")
+        p_bad.set_callbacks(
+            on_prepare=lambda tx: True,
+            on_commit=lambda tx: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+
+        tx_id = coord.begin_transaction()
+        coord.register_participant(tx_id, p_good)
+        coord.register_participant(tx_id, p_bad)
+
+        with pytest.raises(CommitFailedError):
+            coord.execute_transaction(tx_id)
+
+        # 事务仍标记为 COMMITTED
+        assert coord.get_transaction_state(tx_id) == TransactionState.COMMITTED
+
+    def test_commit_idempotent_after_partial_failure(self) -> None:
+        """对已 COMMITTED 的事务再次 commit 应幂等返回，不抛异常"""
+        coord = TransactionCoordinator()
+        p1 = TransactionParticipant("p1")
+        p1.set_callbacks(
+            on_prepare=lambda tx: True,
+            on_commit=lambda tx: (_ for _ in ()).throw(RuntimeError("fail-once")),
+        )
+
+        tx_id = coord.begin_transaction()
+        coord.register_participant(tx_id, p1)
+
+        coord.prepare_transaction(tx_id)
+        with pytest.raises(CommitFailedError):
+            coord.commit_transaction(tx_id)
+
+        # 第二次调用应幂等返回（已 COMMITTED）
+        coord.commit_transaction(tx_id)  # 不应抛异常
+
+
+class TestAbortCallbackFailure:
+    """问题3修复：参与者 abort 回调失败的处置策略"""
+
+    def test_abort_callback_failure_keeps_coordinator_in_aborting(self) -> None:
+        """某参与者 abort 回调失败时，协调器保持 ABORTING 状态"""
+        coord = TransactionCoordinator()
+        t1 = CallTracker()
+        t2 = CallTracker()
+
+        p_good = TransactionParticipant("good")
+        p_good.set_callbacks(
+            on_prepare=t1.prepare,
+            on_abort=t1.abort,
+        )
+
+        p_bad = TransactionParticipant("bad")
+        p_bad.set_callbacks(
+            on_prepare=lambda tx: True,
+            on_abort=lambda tx: (_ for _ in ()).throw(RuntimeError("unreliable network")),
+        )
+
+        tx_id = coord.begin_transaction()
+        coord.register_participant(tx_id, p_good)
+        coord.register_participant(tx_id, p_bad)
+
+        coord.prepare_transaction(tx_id)
+        coord.abort_transaction(tx_id)
+
+        # 协调器保持 ABORTING
+        assert coord.get_transaction_state(tx_id) == TransactionState.ABORTING
+        # good 参与者已 ABORTED
+        assert p_good.get_state(tx_id) == ParticipantState.ABORTED
+        # bad 参与者状态回退（未到 ABORTED）
+        assert p_bad.get_state(tx_id) == ParticipantState.PREPARED
+
+        # 查询方法返回正确结果
+        assert coord.has_incomplete_abort(tx_id) is True
+        assert coord.get_abort_failed_participants(tx_id) == ["bad"]
+
+    def test_retry_abort_succeeds_after_fix(self) -> None:
+        """retry_abort 可以成功完成之前失败的参与者"""
+        coord = TransactionCoordinator()
+        bad_state = {"should_fail": True}
+
+        def flaky_abort(tx_id: str) -> None:
+            if bad_state["should_fail"]:
+                raise RuntimeError("network partition")
+            # 否则成功
+
+        p = TransactionParticipant("flaky")
+        p.set_callbacks(on_prepare=lambda tx: True, on_abort=flaky_abort)
+
+        tx_id = coord.begin_transaction()
+        coord.register_participant(tx_id, p)
+
+        coord.prepare_transaction(tx_id)
+        coord.abort_transaction(tx_id)
+
+        # 第一次失败
+        assert coord.has_incomplete_abort(tx_id) is True
+        assert coord.retry_abort(tx_id) is False
+        assert coord.get_transaction_state(tx_id) == TransactionState.ABORTING
+
+        # 修复后重试
+        bad_state["should_fail"] = False
+        assert coord.retry_abort(tx_id) is True
+        assert coord.get_transaction_state(tx_id) == TransactionState.ABORTED
+        assert p.get_state(tx_id) == ParticipantState.ABORTED
+        assert coord.has_incomplete_abort(tx_id) is False
+        assert coord.get_abort_failed_participants(tx_id) == []
+
+    def test_retry_abort_on_non_aborting_raises(self) -> None:
+        """对非 ABORTING 状态的事务调用 retry_abort 应抛错"""
+        coord = TransactionCoordinator()
+        tx_id = coord.begin_transaction()
+        coord.prepare_transaction(tx_id)
+        coord.commit_transaction(tx_id)
+
+        with pytest.raises(TransactionStateError):
+            coord.retry_abort(tx_id)
+
+    def test_retry_abort_on_aborted_is_noop(self) -> None:
+        """对已 ABORTED 的事务调用 retry_abort 返回 True，无副作用"""
+        tracker = CallTracker()
+        coord = TransactionCoordinator()
+        p = TransactionParticipant("p1")
+        p.set_callbacks(on_prepare=tracker.prepare, on_abort=tracker.abort)
+
+        tx_id = coord.begin_transaction()
+        coord.register_participant(tx_id, p)
+        coord.prepare_transaction(tx_id)
+        coord.abort_transaction(tx_id)
+
+        assert coord.get_transaction_state(tx_id) == TransactionState.ABORTED
+        abort_count_before = tracker.abort_calls.get(tx_id, 0)
+        assert coord.retry_abort(tx_id) is True
+        # 不产生额外副作用
+        assert tracker.abort_calls.get(tx_id, 0) == abort_count_before
+
+    def test_multiple_participants_abort_failure(self) -> None:
+        """多个参与者 abort 失败的场景"""
+        coord = TransactionCoordinator()
+
+        def always_fail(tx: str) -> None:
+            raise RuntimeError("always fail")
+
+        p1 = TransactionParticipant("p1")
+        p1.set_callbacks(on_prepare=lambda tx: True, on_abort=always_fail)
+        p2 = TransactionParticipant("p2")
+        p2.set_callbacks(on_prepare=lambda tx: True, on_abort=always_fail)
+        p3 = TransactionParticipant("p3")
+        p3.set_callbacks(on_prepare=lambda tx: True, on_abort=lambda tx: None)
+
+        tx_id = coord.begin_transaction()
+        coord.register_participant(tx_id, p1)
+        coord.register_participant(tx_id, p2)
+        coord.register_participant(tx_id, p3)
+
+        coord.prepare_transaction(tx_id)
+        coord.abort_transaction(tx_id)
+
+        assert coord.get_transaction_state(tx_id) == TransactionState.ABORTING
+        assert coord.has_incomplete_abort(tx_id) is True
+        failed = coord.get_abort_failed_participants(tx_id)
+        assert "p1" in failed
+        assert "p2" in failed
+        assert "p3" not in failed
+        assert p3.get_state(tx_id) == ParticipantState.ABORTED
+
+
+# ---------------------------------------------------------------------------
+# Test for AbortFailedError exception class
+# ---------------------------------------------------------------------------
+class TestAbortFailedError:
+    def test_abort_failed_error_is_transaction_error(self) -> None:
+        from solocoder_4_py.transaction_coordination import AbortFailedError
+        assert issubclass(AbortFailedError, TransactionError)
+

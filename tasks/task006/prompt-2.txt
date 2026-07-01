@@ -1,0 +1,8 @@
+你实现的事务日志管理功能模块存在一些问题，需要修复：
+1. checkpoint 方法通过 object.__setattr__ 绕过 LogEntry 的 frozen=True 来强制修改 LSN，破坏了追加式日志不可变的核心语义。外部引用持有的日志条目其 LSN 会无警告改变，损害审计追溯和恢复可信度。需要将 LSN 从 LogEntry 中移除改为由管理器隐式维护，或改为全局单调递增编号。
+2. rollback 和 simulate_crash_and_recover 方法中使用 `old_value is None` 判断键是否在操作前不存在，当 SET 操作的 old_value 恰好为 None 时，回滚逻辑错误执行 delete 而非恢复为 None。None 同时充当了「键不存在」的哨兵值和合法数据值，产生语义冲突。需要引入独立的缺失标记对象区分这两种情况。
+3. simulate_crash_and_recover 方法中存在定义了但从未使用的局部变量 start_lsn，属于死代码。需要清理。
+4. checkpoint 方法中存在相同的赋值 self._next_lsn = len(self._log) 分别在日志截断后和 LSN 重编号后各执行一次，中间操作不改变条目数量故结果一致，属于冗余代码。需要删除重复赋值。
+5. 修复后需要为该模块补充以 None 作为合法存储值的 SET、回滚和崩溃恢复场景的单元测试，并补充恢复计数（redo_count 和 undo_count）的精确断言。
+6. 更新 README.md 说明修复后的 LSN 维护策略、None 值处理和恢复过程说明。
+7. 重新运行 poetry run pytest tests/transaction_log/ -q，需要让所有测试通过。

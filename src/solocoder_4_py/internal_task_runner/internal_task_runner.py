@@ -4,6 +4,7 @@ import threading
 import time
 import traceback
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -64,51 +65,76 @@ class InternalTaskRunner:
 
     使用纯内存数据结构管理任务定义和运行记录，支持：
     - 一次性任务（ONE_SHOT）
-    - 周期任务（PERIODIC）
+    - 周期任务（PERIODIC），支持暂停/恢复与追赶补偿（catch_up）
     - 手动触发任务（MANUAL）
     - 完整运行历史记录与查询
-    - 可注入时间提供者，便于测试（不依赖真实等待）
+    - 可注入 time_provider / sleep_provider，便于测试（不依赖真实等待）
+    - handler 超时中断（ThreadPoolExecutor + Future.result(timeout)）
+    - 重试间延迟（retry_delay_seconds + 可注入 sleep_provider）
+    - 终态竞态防护：执行前再次校验终态 → 写入 SKIPPED 记录
     - 线程安全操作
     """
 
     def __init__(
         self,
         time_provider: Optional[Callable[[], float]] = None,
+        sleep_provider: Optional[Callable[[float], None]] = None,
         history_limit: int = DEFAULT_HISTORY_LIMIT,
     ) -> None:
         """
         Args:
             time_provider: 可注入的时间提供者函数，默认使用 time.time()
-                          测试时可传入自定义函数以模拟时间流逝
+            sleep_provider: 可注入的睡眠函数，默认使用 time.sleep()。
+                           测试时可传入 no-op 或 FakeClock 的 advance 包装，
+                           以避免真实等待。
             history_limit: 每个任务的运行历史最大保留条数
         """
         self._tasks: Dict[str, TaskRuntimeInfo] = {}
         self._history: Dict[str, Deque[TaskRunRecord]] = {}
         self._tag_index: Dict[str, Set[str]] = {}
         self._time_provider: Callable[[], float] = time_provider or time.time
+        self._sleep_provider: Callable[[float], None] = sleep_provider or time.sleep
         self._history_limit = history_limit
         self._lock = threading.RLock()
         self._run_count_total = 0
         self._success_count_total = 0
         self._failure_count_total = 0
         self._skip_count_total = 0
+        self._executor = ThreadPoolExecutor(thread_name_prefix="solo-task-runner")
 
     # ------------------------------------------------------------------
-    # 时间辅助方法
+    # 时间/睡眠辅助
     # ------------------------------------------------------------------
     def _now(self) -> float:
         return self._time_provider()
+
+    def _sleep(self, seconds: float) -> None:
+        if seconds <= 0:
+            return
+        self._sleep_provider(seconds)
 
     def set_time_provider(self, time_provider: Callable[[], float]) -> None:
         """设置自定义时间提供者（用于测试）"""
         with self._lock:
             self._time_provider = time_provider
 
+    def set_sleep_provider(self, sleep_provider: Callable[[float], None]) -> None:
+        """设置自定义睡眠提供者（用于测试重试延迟）"""
+        with self._lock:
+            self._sleep_provider = sleep_provider
+
+    def shutdown(self, wait: bool = True) -> None:
+        """关闭内部线程池"""
+        self._executor.shutdown(wait=wait)
+
     # ------------------------------------------------------------------
     # 任务注册与注销
     # ------------------------------------------------------------------
     def register(self, definition: TaskDefinition) -> TaskRuntimeInfo:
         """注册任务
+
+        说明：PERIODIC 任务的 interval_seconds 校验已在 TaskDefinition.__post_init__
+             中完成，此处不再重复检查。
 
         Args:
             definition: 任务定义
@@ -118,15 +144,11 @@ class InternalTaskRunner:
 
         Raises:
             TaskAlreadyRegisteredError: 如果任务已存在
-            InvalidScheduleError: 如果调度参数非法
         """
         with self._lock:
             task_id = definition.task_id
             if task_id in self._tasks:
                 raise TaskAlreadyRegisteredError(task_id)
-
-            if definition.is_periodic() and definition.interval_seconds is None:
-                raise InvalidScheduleError("周期任务必须指定 interval_seconds")
 
             runtime_info = TaskRuntimeInfo(
                 definition=definition,
@@ -212,6 +234,7 @@ class InternalTaskRunner:
             info.status = TaskStatus.ACTIVE
             info.activated_at = now
             info.paused_at = None
+            info.catch_up = False
 
             definition = info.definition
             if definition.is_periodic():
@@ -244,11 +267,18 @@ class InternalTaskRunner:
             info.paused_at = self._now()
             return info
 
-    def resume(self, task_id: str) -> TaskRuntimeInfo:
+    def resume(self, task_id: str, catch_up: bool = False) -> TaskRuntimeInfo:
         """恢复暂停的周期任务
 
         Args:
             task_id: 任务ID
+            catch_up: 是否启用追赶补偿。
+                - False（默认）：next_run_at 重置为 ``now + interval_seconds``，
+                  丢弃暂停期间应执行的所有周期。适合心跳、最新状态同步等任务。
+                - True：保留原 next_run_at，后续 tick() 将按原调度逐周期补跑，
+                  直到追上当前时间。适合每日结算、数据同步等不可遗漏的任务。
+                  为避免一次 tick 执行过多，追赶采用逐次 tick 每次执行一周期
+                  的方式，不会瞬间爆发大量运行。
 
         Returns:
             更新后的任务运行时信息
@@ -267,8 +297,16 @@ class InternalTaskRunner:
 
             now = self._now()
             info.status = TaskStatus.ACTIVE
-            info.next_run_at = now + (info.definition.interval_seconds or 0)
             info.paused_at = None
+
+            if catch_up:
+                info.catch_up = True
+                if info.next_run_at is None:
+                    info.next_run_at = now + (info.definition.interval_seconds or 0)
+            else:
+                info.catch_up = False
+                info.next_run_at = now + (info.definition.interval_seconds or 0)
+
             return info
 
     def cancel(self, task_id: str) -> TaskRuntimeInfo:
@@ -316,6 +354,7 @@ class InternalTaskRunner:
             info.cancelled_at = None
             info.next_run_at = None
             info.last_error = None
+            info.catch_up = False
             return info
 
     # ------------------------------------------------------------------
@@ -324,15 +363,15 @@ class InternalTaskRunner:
     def trigger(self, task_id: str, **kwargs: Any) -> TaskRunRecord:
         """手动触发一个任务执行
 
-        - MANUAL 类型：任何状态下（非终态）都可以手动触发
-        - ONE_SHOT / PERIODIC：也允许手动触发，但必须在 ACTIVE 状态
+        说明：为避免「状态校验 → handler 执行」间的竞态（窗口期被 cancel），
+             实际的终态二次校验在 ``_execute_single_run`` 入口处持锁完成。
 
         Args:
             task_id: 任务ID
             **kwargs: 传递给任务 handler 的参数
 
         Returns:
-            本次运行记录
+            本次运行记录（可能是 SUCCESS / FAILED / SKIPPED）
 
         Raises:
             TaskNotFoundError, TaskStateError
@@ -356,9 +395,11 @@ class InternalTaskRunner:
     def tick(self) -> List[TaskRunRecord]:
         """推进调度器，处理到期的任务
 
-        此方法检查所有 ACTIVE 状态的任务：
-        - ONE_SHOT: 首次 tick 时执行一次，执行后标记 COMPLETED
-        - PERIODIC: 到达 next_run_at 时执行，更新 next_run_at
+        对所有 ACTIVE 状态的任务：
+        - ONE_SHOT：首次 tick 时执行一次，执行后标记 COMPLETED（失败则 ERROR）
+        - PERIODIC：到达 ``next_run_at`` 时执行
+            - 默认模式：若落后多个周期，跳跃到 ``now + interval``，避免爆发式补跑
+            - 追赶模式（``catch_up=True``）：每次 tick 补跑一个周期，直到追上 now
 
         Returns:
             本次 tick 中产生的运行记录列表
@@ -367,7 +408,6 @@ class InternalTaskRunner:
         """
         records: List[TaskRunRecord] = []
         with self._lock:
-            now = self._now()
             task_ids = list(self._tasks.keys())
 
         for task_id in task_ids:
@@ -378,6 +418,7 @@ class InternalTaskRunner:
                 if info.status != TaskStatus.ACTIVE:
                     continue
 
+                now = self._now()
                 definition = info.definition
                 should_run = False
 
@@ -404,9 +445,16 @@ class InternalTaskRunner:
                     info.completed_at = now2
                 elif definition.is_periodic() and info.status == TaskStatus.ACTIVE:
                     if info.next_run_at is not None:
-                        info.next_run_at += definition.interval_seconds or 0
-                        if info.next_run_at <= now2:
-                            info.next_run_at = now2 + (definition.interval_seconds or 0)
+                        interval = definition.interval_seconds or 0
+                        info.next_run_at += interval
+                        # 追赶模式（catch_up）：每次只前进一个 interval，
+                        # 留给下一次 tick 继续补跑，避免单次 tick 爆发执行。
+                        # 非追赶模式：若仍然落后，则直接跳到 now + interval。
+                        if not info.catch_up and info.next_run_at <= now2:
+                            info.next_run_at = now2 + interval
+                        # 如果 catch_up 已追平（next_run_at > now），关闭标志
+                        if info.catch_up and info.next_run_at > now2:
+                            info.catch_up = False
 
         return records
 
@@ -656,34 +704,146 @@ class InternalTaskRunner:
             self._history[task_id] = deque(maxlen=self._history_limit)
         self._history[task_id].append(record)
 
+    def _commit_run_record(self, task_id: str, record: TaskRunRecord) -> None:
+        """将运行记录写入历史、更新计数（必须在锁内调用）"""
+        self._append_history(task_id, record)
+        task = self._tasks.get(task_id)
+        if task is None:
+            return
+
+        task.last_run_at = record.started_at
+        task.run_count += 1
+        self._run_count_total += 1
+
+        if record.is_success:
+            task.success_count += 1
+            self._success_count_total += 1
+            task.last_error = None
+        elif record.is_failed:
+            task.failure_count += 1
+            self._failure_count_total += 1
+            task.last_error = record.error_message
+            if task.definition.is_one_shot():
+                task.status = TaskStatus.ERROR
+        else:  # SKIPPED
+            task.skip_count += 1
+            self._skip_count_total += 1
+
     def _execute_single_run(
         self,
         info: TaskRuntimeInfo,
         trigger: str,
         extra_kwargs: Optional[Dict[str, Any]] = None,
     ) -> TaskRunRecord:
-        """执行单次任务运行（含重试逻辑）
+        """执行单次任务运行
 
-        注意：此方法内部对 info 的更新需要持有锁的调用方保证外部一致性，
-        但 handler 调用期间锁会被释放以避免阻塞。
+        主要步骤：
+        1. **入口终态二次校验**（锁内）：解决 trigger/tick 状态检查与 handler 执行
+           之间的竞态窗口。若任务已为终态，直接写入 SKIPPED 记录并返回。
+        2. 循环尝试（含重试）：
+           a. 读取 handler、超时时间等配置（快照，避免动态替换期间产生不一致）
+           b. 若 attempt > 1 且配置了 retry_delay_seconds，在重试前睡眠
+           c. 使用 ThreadPoolExecutor.submit 执行 handler，
+              future.result(timeout=timeout_seconds) 做超时控制
+           d. 成功则构造 SUCCESS 记录并 break
+           e. 失败（包括超时）则记录错误，未到 max_retries 则 continue
+        3. 写入历史并更新计数（锁内）。
+
+        Args:
+            info: 任务运行时信息（传入时由调用方持锁读取，但本函数不依赖外部锁状态）
+            trigger: SCHEDULE / MANUAL
+            extra_kwargs: 传给 handler 的额外参数
         """
-        definition = info.definition
-        task_id = definition.task_id
+        task_id = info.definition.task_id
         kwargs = dict(extra_kwargs or {})
 
-        max_retries = definition.max_retries
+        # ================================================================
+        # 步骤 1：入口终态二次校验 —— 修复竞态窗口（#4）
+        # ================================================================
+        with self._lock:
+            now_entry = self._now()
+            current = self._tasks.get(task_id)
+            if current is None:
+                # 任务在窗口期被注销，记录 SKIPPED（无 handler 可执行）
+                record = TaskRunRecord(
+                    task_id=task_id,
+                    status=RunStatus.SKIPPED,
+                    started_at=now_entry,
+                    finished_at=now_entry,
+                    error_message="任务已被注销，跳过执行",
+                    attempt=1,
+                    trigger=trigger,
+                )
+                return record
+
+            if current.status in TERMINAL_TASK_STATUSES:
+                # 任务在窗口期被取消/完成，记录 SKIPPED
+                record = TaskRunRecord(
+                    task_id=task_id,
+                    status=RunStatus.SKIPPED,
+                    started_at=now_entry,
+                    finished_at=now_entry,
+                    error_message=f"任务已为终态 {current.status.value}，跳过执行",
+                    attempt=1,
+                    trigger=trigger,
+                )
+                self._commit_run_record(task_id, record)
+                return record
+
+            definition_snapshot = current.definition
+
+        # ================================================================
+        # 步骤 2：循环尝试（含重试 / 超时 / 重试延迟）
+        # ================================================================
+        max_retries = definition_snapshot.max_retries
+        retry_delay = max(0.0, definition_snapshot.retry_delay_seconds or 0.0)
+        timeout = (
+            definition_snapshot.timeout_seconds
+            if definition_snapshot.timeout_seconds is not None
+            and definition_snapshot.timeout_seconds > 0
+            else None
+        )
+
         attempt = 0
-        last_error: Optional[Exception] = None
         last_record: Optional[TaskRunRecord] = None
 
         while True:
             attempt += 1
+
+            # 重试前的延迟（不阻塞首次执行，修复 #1 后半）
+            if attempt > 1 and retry_delay > 0:
+                self._sleep(retry_delay)
+
             started_at = self._now()
 
+            # —— 执行 handler（带超时控制，修复 #1 前半）——
+            result: Any = None
+            exc: Optional[BaseException] = None
+            timed_out = False
+
             try:
-                result = definition.handler(**kwargs)
-                finished_at = self._now()
-                record = TaskRunRecord(
+                if timeout is not None:
+                    future: Future = self._executor.submit(
+                        definition_snapshot.handler, **kwargs
+                    )
+                    try:
+                        result = future.result(timeout=timeout)
+                    except FuturesTimeoutError:
+                        # 尝试取消（Python 线程无法被强制 kill，但可以标记取消）
+                        future.cancel()
+                        timed_out = True
+                        raise TimeoutError(
+                            f"任务 handler 执行超时（>{timeout}s）"
+                        )
+                else:
+                    result = definition_snapshot.handler(**kwargs)
+            except BaseException as e:  # noqa: BLE001 —— 捕获所有异常，包括用户 handler 的 BaseException
+                exc = e
+
+            finished_at = self._now()
+
+            if exc is None:
+                last_record = TaskRunRecord(
                     task_id=task_id,
                     status=RunStatus.SUCCESS,
                     started_at=started_at,
@@ -692,56 +852,42 @@ class InternalTaskRunner:
                     attempt=attempt,
                     trigger=trigger,
                 )
-                last_record = record
-                last_error = None
                 break
-            except Exception as e:
-                finished_at = self._now()
-                last_error = e
 
-                if attempt <= max_retries:
-                    continue
+            # —— 异常分支：判断是否重试 ——
+            error_type = type(exc).__name__
+            error_msg = str(exc)
+            if timed_out:
+                error_type = "TimeoutError"
+                error_msg = error_msg or f"任务 handler 执行超时（>{timeout}s）"
 
-                record = TaskRunRecord(
-                    task_id=task_id,
-                    status=RunStatus.FAILED,
-                    started_at=started_at,
-                    finished_at=finished_at,
-                    error_message=str(e),
-                    error_type=type(e).__name__,
-                    attempt=attempt,
-                    trigger=trigger,
-                )
-                last_record = record
-                break
+            if attempt <= max_retries:
+                # 继续重试
+                continue
+
+            last_record = TaskRunRecord(
+                task_id=task_id,
+                status=RunStatus.FAILED,
+                started_at=started_at,
+                finished_at=finished_at,
+                error_message=error_msg,
+                error_type=error_type,
+                attempt=attempt,
+                trigger=trigger,
+            )
+            break
 
         assert last_record is not None
 
+        # ================================================================
+        # 步骤 3：提交运行记录（锁内）
+        # ================================================================
         with self._lock:
-            self._append_history(task_id, last_record)
-
+            # 再次确认任务仍存在（可能在执行期间被注销）
             if task_id in self._tasks:
-                info = self._tasks[task_id]
-                info.last_run_at = last_record.started_at
-                info.run_count += 1
-                self._run_count_total += 1
-
-                if last_record.is_success:
-                    info.success_count += 1
-                    self._success_count_total += 1
-                    info.last_error = None
-                elif last_record.is_failed:
-                    info.failure_count += 1
-                    self._failure_count_total += 1
-                    info.last_error = last_record.error_message
-                    if definition.is_one_shot():
-                        info.status = TaskStatus.ERROR
-                else:
-                    info.skip_count += 1
-                    self._skip_count_total += 1
-
-        if last_record.is_failed and last_error is not None:
-            info.last_error = last_record.error_message
+                self._commit_run_record(task_id, last_record)
+            else:
+                self._append_history(task_id, last_record)
 
         return last_record
 

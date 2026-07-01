@@ -82,6 +82,7 @@ class TaskRuntimeInfo:
     failure_count: int = 0
     skip_count: int = 0
     last_error: Optional[str] = None
+    catch_up: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -100,4 +101,5 @@ class TaskRuntimeInfo:
             "failure_count": self.failure_count,
             "skip_count": self.skip_count,
             "last_error": self.last_error,
+            "catch_up": self.catch_up,
         }

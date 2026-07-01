@@ -48,14 +48,8 @@ class CacheKeyGenerator:
     def generate(self, request_params: Dict[str, Any],
                  data_entities: Optional[List[str]] = None) -> str:
         normalized_params = _normalize_dict(request_params)
-        normalized_entities = sorted(data_entities or [])
 
-        key_components = {
-            "params": normalized_params,
-            "entities": normalized_entities,
-        }
-
-        serialized = _serialize_to_json(key_components)
+        serialized = _serialize_to_json(normalized_params)
         hash_digest = hashlib.new(self.algorithm, serialized.encode("utf-8")).hexdigest()
 
         return f"{self.prefix}:{hash_digest}"

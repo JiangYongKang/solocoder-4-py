@@ -1,0 +1,10 @@
+产物不满意：
+1. get 方法存在冗余 TTL 检查和清理统计遗漏：_cleanup_expired() 批量清理之后仍保留了原有的逐条目 TTL 检查逻辑（第 95-99 行）。触发节点为 snapshot_cache.py 的 get 方法。业务影响是当某条目恰好被逐条目检查而非 _cleanup_expired 捕获清理时，ttl_cleanups 统计不会递增，导致统计失真。根本原因是修复在 get 开头添加了 _cleanup_expired() 调用但未删除原有的冗余 TTL 检查代码。解决方案是删除 get 方法中第 95-99 行的冗余 TTL 检查，统一由 _cleanup_expired() 负责过期清理。
+2. _set_internal 方法接受 ttl 参数但未实际使用：方法签名包含 ttl: Optional[float] = None，但方法体内不将其传递给 CacheEntry 也不存储。触发节点为 snapshot_cache.py 的 _set_internal 方法。业务影响是用户通过 set(..., ttl=60) 设置的逐条目 TTL 不会生效，只有 default_ttl 起作用。根本原因是 _set_internal 实现遗漏了 per-entry TTL 的存储和校验逻辑。解决方案是在 CacheEntry 中增加 ttl 字段，_set_internal 写入时存储，_cleanup_expired 按 entry.ttl 做失效判断。
+3. has 方法版本失效后不驱逐条目：当 _cleanup_expired 后条目存在但 check_versions_valid 返回 False 时，has 直接返回 False 而失效条目仍保留在内存中。触发节点为 snapshot_cache.py 的 has 方法第 228-231 行。业务影响是版本已失效的条目不会被主动清理，与 get 方法在版本校验失败时主动 _evict_internal 的行为不一致，len 和 get_stats 返回的 size 可能虚高。根本原因是 has 作为只读方法未实现版本失效后的自动驱逐。解决方案是在 check_versions_valid 返回 False 时调用 _evict_internal 清理条目。
+
+过程不满意：
+1. snapshot_cache.py 文件意外丢失导致重复写入：模型首次写入后运行测试发现文件不存在，需重新从头写入。触发节点为 session-cot-2 第 282-299 行。实际行为是浪费一次完整文件写入操作，增加了代码不一致风险。根本原因是 Write 工具可能在写入后未能正确持久化，模型被动重写而非主动验证。解决方案是在 Write 操作后使用 Read 工具验证文件写入成功。
+2. 原有测试 test_different_entities_same_params 和 test_same_key_different_entities 的修改引入了语义降级。触发节点为 session-cot-2 第 149-169 行。实际行为是两个测试从验证"不同实体生成不同键"改为验证"相同参数共享键且后写入覆盖先写入"，删除了多实体并发共存场景的测试覆盖。根本原因是测试修改完全迎合新行为而未保留边界场景的测试。解决方案是补充测试验证同一参数不同实体列表交替操作时的版本校验隔离性。
+3. _cleanup_expired 方法每次调用遍历 self._cache 所有条目的 O(n) 全量扫描，而该清理在 get、set、has、__len__、__contains__、get_stats 等所有公共方法中均被触发。触发节点为 snapshot_cache.py 第 50-68 行。业务影响是对于大容量缓存，高频调用场景下每次操作都会产生 O(n) 扫描开销，可能引发性能退化。根本原因是惰性清理策略选择了全量扫描而非增量式或定时式清理。解决方案是改用基于时间戳有序的数据结构或降低清理触发频率。
+4. session-cot-2 中未提及对 constants.py 或 exceptions.py 等模块辅助文件的检查和修改。触发节点为 session-cot-2 全文。实际行为是修复聚焦于 snapshot_cache.py 和 cache_key.py 两个核心文件，未对模块全部源文件做完整性审查。根本原因是修复范围过于聚焦核心逻辑文件。解决方案是修复完成后应对模块所有源文件做全面合规性检查。

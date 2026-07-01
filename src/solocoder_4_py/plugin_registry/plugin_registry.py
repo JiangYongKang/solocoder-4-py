@@ -7,8 +7,10 @@ from .constants import MINIMUM_SUPPORTED_VERSION, PluginStatus
 from .exceptions import (
     PluginAlreadyRegisteredError,
     PluginCapabilityError,
+    PluginDependencyError,
     PluginNotFoundError,
     PluginStateError,
+    PluginVersionError,
 )
 from .plugin_metadata import PluginMetadata, PluginRuntimeInfo
 
@@ -137,6 +139,10 @@ class PluginRegistry:
     def enable(self, plugin_id: str, required_version: Optional[str] = None) -> PluginRuntimeInfo:
         """启用插件
 
+        启用前会校验：
+        1. 插件自身版本满足要求（如果指定了 required_version）
+        2. 所有依赖插件已注册、已启用且版本满足要求
+
         Args:
             plugin_id: 插件ID
             required_version: 可选的版本要求
@@ -148,6 +154,7 @@ class PluginRegistry:
             PluginNotFoundError: 如果插件不存在
             PluginVersionError: 如果版本不满足要求
             PluginStateError: 如果插件已启用
+            PluginDependencyError: 如果依赖插件不满足要求
         """
         with self._lock:
             runtime_info = self._get_plugin_or_raise(plugin_id)
@@ -158,6 +165,8 @@ class PluginRegistry:
             if required_version is not None:
                 runtime_info.metadata.check_compatibility(required_version)
 
+            self._validate_dependencies(plugin_id, runtime_info.metadata.dependencies)
+
             runtime_info.status = PluginStatus.ENABLED
             runtime_info.enabled_at = time.time()
             runtime_info.disabled_at = None
@@ -165,6 +174,46 @@ class PluginRegistry:
             runtime_info.last_error = None
 
             return runtime_info
+
+    def _validate_dependencies(
+        self,
+        plugin_id: str,
+        dependencies: Dict[str, str],
+    ) -> None:
+        """校验插件的所有依赖是否满足要求
+
+        Args:
+            plugin_id: 待校验的插件ID
+            dependencies: 依赖声明字典 {dependency_id: version_requirement}
+
+        Raises:
+            PluginDependencyError: 如果任一依赖不满足要求
+        """
+        for dep_id, dep_version_req in dependencies.items():
+            if dep_id not in self._plugins:
+                raise PluginDependencyError(
+                    plugin_id=plugin_id,
+                    dependency_id=dep_id,
+                    reason="依赖插件未注册",
+                )
+
+            dep_runtime = self._plugins[dep_id]
+            if dep_runtime.status != PluginStatus.ENABLED:
+                raise PluginDependencyError(
+                    plugin_id=plugin_id,
+                    dependency_id=dep_id,
+                    reason=f"依赖插件未启用（当前状态: {dep_runtime.status.value}）",
+                )
+
+            if not dep_runtime.metadata.satisfies_version(dep_version_req):
+                raise PluginDependencyError(
+                    plugin_id=plugin_id,
+                    dependency_id=dep_id,
+                    reason=(
+                        f"依赖版本不满足要求: 当前版本 {dep_runtime.metadata.version}, "
+                        f"要求 {dep_version_req}"
+                    ),
+                )
 
     def disable(self, plugin_id: str) -> PluginRuntimeInfo:
         """停用插件
@@ -196,6 +245,11 @@ class PluginRegistry:
     def set_status(self, plugin_id: str, status: PluginStatus) -> PluginRuntimeInfo:
         """设置插件状态
 
+        该方法是状态转变的统一入口，所有状态变更都会委托给对应的专用方法：
+        - ENABLED → 调用 enable()，执行完整的版本和依赖校验
+        - DISABLED → 调用 disable()
+        - REGISTERED → 直接设置（未启用状态无需校验）
+
         Args:
             plugin_id: 插件ID
             status: 目标状态
@@ -205,23 +259,21 @@ class PluginRegistry:
 
         Raises:
             PluginNotFoundError: 如果插件不存在
+            PluginVersionError: 如果版本不满足要求（仅 ENABLED 时）
+            PluginStateError: 如果状态转换非法
+            PluginDependencyError: 如果依赖不满足要求（仅 ENABLED 时）
         """
         with self._lock:
-            runtime_info = self._get_plugin_or_raise(plugin_id)
-
-            if status == PluginStatus.ENABLED and runtime_info.status != PluginStatus.ENABLED:
-                runtime_info.status = PluginStatus.ENABLED
-                runtime_info.enabled_at = time.time()
-                runtime_info.disabled_at = None
-                runtime_info.enable_count += 1
-                runtime_info.last_error = None
-            elif status == PluginStatus.DISABLED and runtime_info.status != PluginStatus.DISABLED:
-                runtime_info.status = PluginStatus.DISABLED
-                runtime_info.disabled_at = time.time()
+            if status == PluginStatus.ENABLED:
+                return self.enable(plugin_id)
+            elif status == PluginStatus.DISABLED:
+                return self.disable(plugin_id)
             elif status == PluginStatus.REGISTERED:
+                runtime_info = self._get_plugin_or_raise(plugin_id)
                 runtime_info.status = PluginStatus.REGISTERED
-
-            return runtime_info
+                return runtime_info
+            else:
+                raise ValueError(f"未知的插件状态: {status}")
 
     def get_status(self, plugin_id: str) -> PluginStatus:
         """获取插件状态
@@ -532,8 +584,17 @@ class PluginRegistry:
     def enable_all(self) -> Dict[str, bool]:
         """启用所有已注册但未启用的插件
 
+        仅捕获业务预期内的 PluginStateError 异常，其他异常（如依赖不满足、
+        版本不兼容、系统级错误等）会直接抛出，由调用方处理。
+
         Returns:
             {plugin_id: 是否成功启用} 的字典
+
+        Raises:
+            PluginDependencyError: 如果某插件的依赖不满足要求
+            PluginVersionError: 如果某插件的版本不满足要求
+            PluginNotFoundError: 如果某插件不存在（理论上不会发生）
+            其他异常: 系统级异常会直接传播
         """
         with self._lock:
             results: Dict[str, bool] = {}
@@ -541,15 +602,21 @@ class PluginRegistry:
                 try:
                     self.enable(plugin_id)
                     results[plugin_id] = True
-                except Exception:
+                except PluginStateError:
                     results[plugin_id] = False
             return results
 
     def disable_all(self) -> Dict[str, bool]:
         """停用所有已启用的插件
 
+        仅捕获业务预期内的 PluginStateError 异常，其他异常会直接抛出。
+
         Returns:
             {plugin_id: 是否成功停用} 的字典
+
+        Raises:
+            PluginNotFoundError: 如果某插件不存在（理论上不会发生）
+            其他异常: 系统级异常会直接传播
         """
         with self._lock:
             results: Dict[str, bool] = {}
@@ -557,7 +624,7 @@ class PluginRegistry:
                 try:
                     self.disable(plugin_id)
                     results[plugin_id] = True
-                except Exception:
+                except PluginStateError:
                     results[plugin_id] = False
             return results
 

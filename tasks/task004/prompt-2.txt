@@ -1,0 +1,9 @@
+你实现的缓存雪崩防护功能模块存在一些问题，需要修复：
+1. RebuildStrategy 枚举定义了 SYNC 和 ASYNC 两种策略，但 _rebuild_cache 和 _do_rebuild 方法中从未读取 strategy 参数，实际执行始终是同步重建，异步策略形同虚设。需要实现 ASYNC 策略的真实异步重建逻辑。
+2. _rebuild_cache 方法在重建超时后直接返回调用方传入的 degraded_value 参数，但未将该降级值写入缓存并标记为 DEGRADED 状态，后续对同一键的请求若未再次传入 degraded_value 将无法获得降级保护。超时后需要将降级值持久化到缓存中。
+3. _renew_hot_key 方法在续期时始终使用 self._default_ttl 计算新过期时间，完全忽略条目通过 set 方法传入的自定义 TTL，导致本该快速淘汰的短 TTL 条目被意外延长。续期时应依据条目自身的 TTL 计算过期时间。
+4. _find_hot_keys_locked 方法中续期阈值使用 self._default_ttl * 0.3 作为基准而非条目的实际剩余 TTL，当条目 TTL 远小于 default_ttl 时后台续期检查间隔内条目已过期。阈值判定应基于条目自身的 TTL 而非全局默认值。
+5. _apply_jitter 方法存在重复获取时间戳的问题，调用方先获取一次时间计算 base_expires_at，方法内部又用第二次时间戳构造下限保护值，两次时间偏差在高并发场景下影响抖动精度。需要消除双重时间戳读取。
+6. 修复后需要为该模块补充异步重建策略生效、降级值持久化、自定义 TTL 续期和短 TTL 续期阈值的单元测试。
+7. 更新 README.md 说明修复后的异步重建行为、降级持久化机制和续期 TTL 继承规则。
+8. 重新运行 poetry run pytest tests/cache_avalanche_guard/ -q，需要让所有测试通过。

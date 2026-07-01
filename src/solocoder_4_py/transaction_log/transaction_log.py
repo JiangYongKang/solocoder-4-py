@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 from uuid import uuid4
 
-from .log_entry import LogEntry, OperationType
+from .log_entry import LogEntry, OperationType, _MISSING
 from .state_store import StateStore
 
 
@@ -20,10 +20,9 @@ class TransactionLogManager:
         self._log: list[LogEntry] = []
         self._state: StateStore = StateStore()
         self._checkpoint_state: Optional[dict[str, Any]] = None
-        self._checkpoint_lsn: int = -1
-        self._next_lsn: int = 0
+        self._checkpoint_index: int = -1
         self._active_transactions: dict[str, Transaction] = {}
-        self._committed_lsns: set[int] = set()
+        self._committed_indexes: set[int] = set()
 
     @property
     def state(self) -> StateStore:
@@ -35,11 +34,11 @@ class TransactionLogManager:
 
     @property
     def checkpoint_lsn(self) -> int:
-        return self._checkpoint_lsn
+        return self._checkpoint_index
 
     @property
     def next_lsn(self) -> int:
-        return self._next_lsn
+        return len(self._log)
 
     def get_log_entry(self, lsn: int) -> Optional[LogEntry]:
         if 0 <= lsn < len(self._log):
@@ -67,7 +66,7 @@ class TransactionLogManager:
         if transaction_id is not None and transaction_id not in self._active_transactions:
             raise ValueError(f"Unknown transaction: {transaction_id}")
 
-        old_value = self._state.get(key)
+        old_value = self._state.set(key, value)
 
         entry = self._create_entry(
             operation=OperationType.SET,
@@ -81,14 +80,13 @@ class TransactionLogManager:
         if transaction_id is not None:
             self._active_transactions[transaction_id].pending_entries.append(entry)
 
-        self._state.set(key, value)
         return old_value
 
     def delete(self, key: str, transaction_id: Optional[str] = None) -> tuple[bool, Any]:
         if transaction_id is not None and transaction_id not in self._active_transactions:
             raise ValueError(f"Unknown transaction: {transaction_id}")
 
-        existed, old_value = self._state.exists(key), self._state.get(key)
+        existed, old_value = self._state.delete(key)
 
         entry = self._create_entry(
             operation=OperationType.DELETE,
@@ -101,7 +99,7 @@ class TransactionLogManager:
         if transaction_id is not None:
             self._active_transactions[transaction_id].pending_entries.append(entry)
 
-        return self._state.delete(key)
+        return existed, old_value
 
     def commit(self, transaction_id: str) -> None:
         if transaction_id not in self._active_transactions:
@@ -120,7 +118,8 @@ class TransactionLogManager:
         tx.active = False
 
         for e in tx.pending_entries:
-            self._committed_lsns.add(e.lsn)
+            idx = self._log.index(e)
+            self._committed_indexes.add(idx)
 
         del self._active_transactions[transaction_id]
 
@@ -135,12 +134,12 @@ class TransactionLogManager:
         data_ops = [e for e in reversed(tx.pending_entries) if e.is_data_operation()]
         for entry in data_ops:
             if entry.operation == OperationType.SET:
-                if entry.old_value is None:
+                if entry.old_value is _MISSING:
                     self._state.delete(entry.key)
                 else:
                     self._state.set(entry.key, entry.old_value)
             elif entry.operation == OperationType.DELETE:
-                if entry.old_value is not None:
+                if entry.old_value is not _MISSING:
                     self._state.set(entry.key, entry.old_value)
 
         rollback_entry = self._create_entry(
@@ -155,31 +154,29 @@ class TransactionLogManager:
         for tx_id in list(self._active_transactions.keys()):
             self.rollback(tx_id)
 
-        checkpoint_lsn = self._next_lsn
+        checkpoint_index = len(self._log)
         self._checkpoint_state = self._state.to_dict()
-        self._checkpoint_lsn = checkpoint_lsn
+        self._checkpoint_index = checkpoint_index
 
         entry = self._create_entry(
             operation=OperationType.CHECKPOINT,
-            value={"state": self._checkpoint_state, "lsn": checkpoint_lsn},
+            value={"state": self._checkpoint_state, "index": checkpoint_index},
         )
         self._append_entry(entry)
 
-        self._log = self._log[checkpoint_lsn:]
-        self._next_lsn = len(self._log)
-        for i, e in enumerate(self._log):
-            object.__setattr__(e, "lsn", i)
-        self._next_lsn = len(self._log)
-        self._committed_lsns = {e.lsn for e in self._log if e.lsn in self._committed_lsns or e.operation == OperationType.COMMIT}
+        self._log = self._log[checkpoint_index:]
+        self._checkpoint_index = 0
+        self._committed_indexes = {
+            i for i, e in enumerate(self._log)
+            if e.operation == OperationType.COMMIT
+        }
 
-        return self._checkpoint_lsn
+        return 0
 
     def simulate_crash_and_recover(self) -> tuple[StateStore, int, int]:
         recovered_state = StateStore()
         redo_entries: list[LogEntry] = []
         undo_transactions: dict[str, list[LogEntry]] = {}
-
-        start_lsn = self._checkpoint_lsn if self._checkpoint_lsn >= 0 else 0
 
         if self._checkpoint_state is not None:
             recovered_state.load_dict(self._checkpoint_state)
@@ -217,12 +214,12 @@ class TransactionLogManager:
             data_ops = [e for e in reversed(entries) if e.is_data_operation()]
             for entry in data_ops:
                 if entry.operation == OperationType.SET:
-                    if entry.old_value is None:
+                    if entry.old_value is _MISSING:
                         recovered_state.delete(entry.key)
                     else:
                         recovered_state.set(entry.key, entry.old_value)
                 elif entry.operation == OperationType.DELETE:
-                    if entry.old_value is not None:
+                    if entry.old_value is not _MISSING:
                         recovered_state.set(entry.key, entry.old_value)
 
         redo_count = len([e for e in redo_entries if e.is_data_operation()])
@@ -240,19 +237,20 @@ class TransactionLogManager:
             lsn = len(self._log)
         removed = lsn
         self._log = self._log[lsn:]
-        for i, e in enumerate(self._log):
-            object.__setattr__(e, "lsn", i)
-        self._next_lsn = len(self._log)
+        if self._checkpoint_index >= 0:
+            self._checkpoint_index = max(0, self._checkpoint_index - lsn)
+        self._committed_indexes = {
+            i - lsn for i in self._committed_indexes if i >= lsn
+        }
         return removed
 
     def reset(self) -> None:
         self._log.clear()
         self._state.clear()
         self._checkpoint_state = None
-        self._checkpoint_lsn = -1
-        self._next_lsn = 0
+        self._checkpoint_index = -1
         self._active_transactions.clear()
-        self._committed_lsns.clear()
+        self._committed_indexes.clear()
 
     def _create_entry(
         self,
@@ -260,7 +258,7 @@ class TransactionLogManager:
         transaction_id: Optional[str] = None,
         key: Optional[str] = None,
         value: Any = None,
-        old_value: Any = None,
+        old_value: Any = _MISSING,
     ) -> LogEntry:
         return LogEntry(
             operation=operation,
@@ -268,10 +266,7 @@ class TransactionLogManager:
             key=key,
             value=value,
             old_value=old_value,
-            lsn=self._next_lsn,
         )
 
     def _append_entry(self, entry: LogEntry) -> None:
         self._log.append(entry)
-        object.__setattr__(entry, "lsn", self._next_lsn)
-        self._next_lsn += 1

@@ -158,7 +158,11 @@ class CacheAvalancheGuard:
                 continue
 
     def _find_hot_keys_locked(self) -> List[Tuple[str, CacheEntry]]:
-        """查找所有热点键（必须在持有锁的情况下调用）"""
+        """查找所有热点键（必须在持有锁的情况下调用）
+
+        续期阈值基于条目自身的 original_ttl 计算，而非全局默认值，
+        避免短 TTL 条目在续期检查间隔内过期。
+        """
         now = time.time()
         hot_keys: List[Tuple[str, CacheEntry]] = []
         for key, entry in self._store.items():
@@ -169,14 +173,19 @@ class CacheAvalancheGuard:
             )
             if recent_hits >= self._hot_key_threshold:
                 remaining_ttl = entry.remaining_ttl(now)
+                entry_ttl = entry.original_ttl if entry.original_ttl is not None else self._default_ttl
                 if remaining_ttl is not None and remaining_ttl < (
-                    self._default_ttl * 0.3
+                    entry_ttl * 0.3
                 ):
                     hot_keys.append((key, entry))
         return hot_keys
 
     def _renew_hot_key(self, key: str, entry: CacheEntry) -> None:
-        """续期单个热点键"""
+        """续期单个热点键
+
+        续期时继承条目自身的 original_ttl，而非使用全局默认值，
+        避免短 TTL 条目被意外延长。
+        """
         if entry.state != CacheEntryState.VALID:
             return
 
@@ -184,8 +193,10 @@ class CacheAvalancheGuard:
             current_entry = self._store.get(key)
             if current_entry is None or current_entry is not entry:
                 return
+            now = time.time()
+            entry_ttl = current_entry.original_ttl if current_entry.original_ttl is not None else self._default_ttl
             new_expires_at = self._apply_jitter(
-                time.time() + self._default_ttl, self._default_ttl
+                now + entry_ttl, entry_ttl, now
             )
             current_entry.expires_at = new_expires_at
             self._stats.background_renews += 1
@@ -193,21 +204,27 @@ class CacheAvalancheGuard:
     # ------------------------------------------------------------
     # 过期时间抖动
     # ------------------------------------------------------------
-    def _apply_jitter(self, base_expires_at: float, ttl: float) -> float:
+    def _apply_jitter(
+        self, base_expires_at: float, ttl: float, now: Optional[float] = None
+    ) -> float:
         """为过期时间添加随机抖动
+
+        使用单一时间戳避免高并发场景下的时间偏差问题。
 
         Args:
             base_expires_at: 基础过期时间戳
             ttl: TTL 秒数，用于计算抖动范围
+            now: 当前时间戳，可选，不提供则使用 time.time()
 
         Returns:
             添加抖动后的过期时间戳
         """
+        current_time = now if now is not None else time.time()
         if self._jitter_ratio <= 0:
             return base_expires_at
         jitter_range = ttl * self._jitter_ratio
         jitter = random.uniform(-jitter_range, jitter_range)
-        return max(time.time() + 0.001, base_expires_at + jitter)
+        return max(current_time + 0.001, base_expires_at + jitter)
 
     # ------------------------------------------------------------
     # 核心读操作
@@ -311,6 +328,10 @@ class CacheAvalancheGuard:
     ) -> Optional[T]:
         """重建缓存，使用单飞模式避免重复重建
 
+        支持 SYNC（同步）和 ASYNC（异步）两种重建策略：
+        - SYNC: 调用方同步等待重建完成，返回加载结果
+        - ASYNC: 调用方立即返回降级值（或 None），重建在后台线程执行
+
         Args:
             key: 缓存键
             loader: 数据加载函数
@@ -334,6 +355,46 @@ class CacheAvalancheGuard:
                 is_rebuilder = False
 
         if is_rebuilder:
+            if strategy == RebuildStrategy.ASYNC:
+                rebuild_thread = threading.Thread(
+                    target=self._do_rebuild_async,
+                    kwargs={
+                        "key": key,
+                        "loader": loader,
+                        "degraded_value": degraded_value,
+                        "tags": tags,
+                        "ttl": ttl,
+                        "event": event,
+                        "lock_key": lock_key,
+                    },
+                    daemon=True,
+                    name=f"cache-rebuild-{key}",
+                )
+                rebuild_thread.start()
+
+                if degraded_value is not None:
+                    with self._lock:
+                        entry = self._store.get(key)
+                        if entry is None:
+                            tag_list = list(tags) if tags is not None else []
+                            entry = CacheEntry(
+                                key=key,
+                                value=None,
+                                degraded_value=degraded_value,
+                                tags=tag_list,
+                            )
+                            self._store[key] = entry
+                            self._update_tag_index(key, [], tag_list)
+                        entry.mark_degraded(
+                            degraded_value=degraded_value,
+                            degraded_ttl=self._degraded_ttl_seconds,
+                        )
+                        if tags is not None:
+                            entry.tags = list(tags)
+                    self._stats.degraded_returns += 1
+                    return degraded_value
+                return None
+
             try:
                 return self._do_rebuild(
                     key=key,
@@ -353,16 +414,77 @@ class CacheAvalancheGuard:
                 with self._lock:
                     entry = self._store.get(key)
                     if entry is not None and entry.is_valid():
+                        if entry.state == CacheEntryState.DEGRADED:
+                            self._stats.degraded_returns += 1
+                            return entry.degraded_value
                         return entry.value
-                    if entry is not None and entry.state == CacheEntryState.DEGRADED:
-                        return entry.degraded_value
+
+            if not wait_result and degraded_value is not None:
+                with self._lock:
+                    entry = self._store.get(key)
+                    tag_list = list(tags) if tags is not None else []
+                    if entry is None:
+                        entry = CacheEntry(
+                            key=key,
+                            value=None,
+                            tags=tag_list,
+                        )
+                        self._store[key] = entry
+                        self._update_tag_index(key, [], tag_list)
+                    entry.mark_degraded(
+                        degraded_value=degraded_value,
+                        degraded_ttl=self._degraded_ttl_seconds,
+                    )
+                    if tags is not None:
+                        entry.tags = tag_list
+                        self._update_tag_index(key, [], tag_list)
+                self._stats.degraded_returns += 1
+                return degraded_value
 
             with self._lock:
                 entry = self._store.get(key)
                 if entry is not None and entry.state == CacheEntryState.DEGRADED:
+                    self._stats.degraded_returns += 1
                     return entry.degraded_value
 
             return degraded_value
+
+    def _do_rebuild_async(
+        self,
+        key: str,
+        loader: Callable[[], T],
+        degraded_value: Optional[Any],
+        tags: Optional[Iterable[str]],
+        ttl: Optional[float],
+        event: threading.Event,
+        lock_key: str,
+    ) -> None:
+        """异步重建缓存的后台线程方法
+
+        Args:
+            key: 缓存键
+            loader: 数据加载函数
+            degraded_value: 降级占位值
+            tags: 标签列表
+            ttl: 自定义 TTL
+            event: 重建完成事件
+            lock_key: 锁键
+        """
+        try:
+            self._do_rebuild(
+                key=key,
+                loader=loader,
+                degraded_value=degraded_value,
+                tags=tags,
+                ttl=ttl,
+                event=event,
+                lock_key=lock_key,
+            )
+        except Exception:
+            pass
+        finally:
+            with self._rebuild_lock:
+                self._rebuild_locks.pop(lock_key, None)
 
     def _do_rebuild(
         self,
@@ -425,16 +547,19 @@ class CacheAvalancheGuard:
                 raise CacheRebuildError(key, exc) from exc
 
             with self._lock:
+                now = time.time()
                 effective_ttl = ttl if ttl is not None else self._default_ttl
-                base_expires_at = time.time() + effective_ttl
-                expires_at = self._apply_jitter(base_expires_at, effective_ttl)
+                base_expires_at = now + effective_ttl
+                expires_at = self._apply_jitter(base_expires_at, effective_ttl, now)
 
                 tag_list = list(tags) if tags is not None else []
 
                 entry = self._store.get(key)
                 if entry is not None:
                     old_tags = entry.tags
-                    entry.mark_rebuilt(value=value, expires_at=expires_at)
+                    entry.mark_rebuilt(
+                        value=value, expires_at=expires_at, original_ttl=effective_ttl
+                    )
                     entry.tags = tag_list
                     self._update_tag_index(key, old_tags, tag_list)
                 else:
@@ -442,6 +567,7 @@ class CacheAvalancheGuard:
                         key=key,
                         value=value,
                         expires_at=expires_at,
+                        original_ttl=effective_ttl,
                         tags=tag_list,
                     )
                     self._store[key] = entry
@@ -484,9 +610,10 @@ class CacheAvalancheGuard:
             创建的缓存条目
         """
         with self._lock:
+            now = time.time()
             effective_ttl = ttl if ttl is not None else self._default_ttl
-            base_expires_at = time.time() + effective_ttl
-            expires_at = self._apply_jitter(base_expires_at, effective_ttl)
+            base_expires_at = now + effective_ttl
+            expires_at = self._apply_jitter(base_expires_at, effective_ttl, now)
 
             tag_list = list(tags) if tags is not None else []
 
@@ -497,6 +624,7 @@ class CacheAvalancheGuard:
                 key=key,
                 value=value,
                 expires_at=expires_at,
+                original_ttl=effective_ttl,
                 tags=tag_list,
             )
             self._store[key] = entry

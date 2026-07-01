@@ -327,6 +327,7 @@ class LayeredCache:
             )
         self._lock = threading.RLock()
         self._stats_loader_calls = 0
+        self._request_stats = CacheStats()
 
     # ------------------------------------------------------------
     # 核心：读穿透访问
@@ -354,19 +355,38 @@ class LayeredCache:
             缓存值，未命中且无 loader 时返回 None
         """
         with self._lock:
+            self._request_stats.accesses += 1
+
             local_entry = self._local.get(key)
             if local_entry is not None:
+                self._request_stats.hits += 1
                 return local_entry.value
 
             shared_entry = self._shared.get(key)
             if shared_entry is not None:
+                self._request_stats.hits += 1
+
+                effective_local_ttl = local_ttl if local_ttl is not None else ttl
+                backfill_shared_no_expiry = False
+                if effective_local_ttl is None:
+                    if shared_entry.expires_at is not None:
+                        effective_local_ttl = max(0.0, shared_entry.remaining_ttl())
+                    else:
+                        backfill_shared_no_expiry = True
+
                 self._local.set(
                     key=key,
                     value=shared_entry.value,
                     tags=shared_entry.tags,
-                    ttl=local_ttl if local_ttl is not None else ttl,
+                    ttl=effective_local_ttl,
                 )
+                if backfill_shared_no_expiry:
+                    local_entry = self._local.get_entry(key)
+                    if local_entry is not None:
+                        local_entry.expires_at = None
                 return shared_entry.value
+
+            self._request_stats.misses += 1
 
             if loader is None:
                 return None
@@ -375,6 +395,9 @@ class LayeredCache:
                 loaded_value = loader()
             except Exception as exc:
                 raise CacheLoaderError(key, exc) from exc
+
+            if loaded_value is None:
+                return None
 
             self._stats_loader_calls += 1
             effective_tags = list(tags) if tags is not None else []
@@ -398,10 +421,14 @@ class LayeredCache:
         loader: Callable[[], T],
         tags: Optional[Iterable[str]] = None,
         **kwargs: Any,
-    ) -> T:
-        """带强制 loader 的获取，loader 必传"""
+    ) -> Optional[T]:
+        """带强制 loader 的获取，loader 必传
+
+        Returns:
+            加载后的缓存值；当 loader 返回 None 时返回 None
+        """
         result = self.get(key=key, loader=loader, tags=tags, **kwargs)
-        return result  # type: ignore[return-value]
+        return result
 
     # ------------------------------------------------------------
     # 单独查询某一层
@@ -414,23 +441,88 @@ class LayeredCache:
         """仅查询共享缓存"""
         return self._shared.get_value(key)
 
-    def get_with_level(self, key: str) -> Tuple[Optional[Any], Optional[CacheLevel]]:
-        """获取值并返回命中的层级"""
+    def get_with_level(
+        self,
+        key: str,
+        loader: Optional[Callable[[], T]] = None,
+        tags: Optional[Iterable[str]] = None,
+        ttl: Optional[float] = None,
+        local_ttl: Optional[float] = None,
+        shared_ttl: Optional[float] = None,
+    ) -> Tuple[Optional[T], Optional[CacheLevel]]:
+        """获取值并返回命中的层级，支持读穿透
+
+        Args:
+            key: 缓存键
+            loader: 数据加载函数，所有层级都未命中时调用
+            tags: 加载时回填到缓存的标签列表
+            ttl: 统一的 TTL（秒），优先级低于 local_ttl/shared_ttl
+            local_ttl: 本地缓存 TTL（秒）
+            shared_ttl: 共享缓存 TTL（秒）
+
+        Returns:
+            (value, level) 元组，level 为 None 表示未命中且无 loader 或 loader 返回 None
+        """
         with self._lock:
+            self._request_stats.accesses += 1
+
             local_entry = self._local.get(key)
             if local_entry is not None:
+                self._request_stats.hits += 1
                 return local_entry.value, CacheLevel.LOCAL
 
             shared_entry = self._shared.get(key)
             if shared_entry is not None:
+                self._request_stats.hits += 1
+
+                effective_local_ttl = local_ttl if local_ttl is not None else ttl
+                backfill_shared_no_expiry = False
+                if effective_local_ttl is None:
+                    if shared_entry.expires_at is not None:
+                        effective_local_ttl = max(0.0, shared_entry.remaining_ttl())
+                    else:
+                        backfill_shared_no_expiry = True
+
                 self._local.set(
                     key=key,
                     value=shared_entry.value,
                     tags=shared_entry.tags,
+                    ttl=effective_local_ttl,
                 )
+                if backfill_shared_no_expiry:
+                    local_entry = self._local.get_entry(key)
+                    if local_entry is not None:
+                        local_entry.expires_at = None
                 return shared_entry.value, CacheLevel.SHARED
 
-            return None, None
+            self._request_stats.misses += 1
+
+            if loader is None:
+                return None, None
+
+            try:
+                loaded_value = loader()
+            except Exception as exc:
+                raise CacheLoaderError(key, exc) from exc
+
+            if loaded_value is None:
+                return None, CacheLevel.SOURCE
+
+            self._stats_loader_calls += 1
+            effective_tags = list(tags) if tags is not None else []
+            self._shared.set(
+                key=key,
+                value=loaded_value,
+                tags=effective_tags,
+                ttl=shared_ttl if shared_ttl is not None else ttl,
+            )
+            self._local.set(
+                key=key,
+                value=loaded_value,
+                tags=effective_tags,
+                ttl=local_ttl if local_ttl is not None else ttl,
+            )
+            return loaded_value, CacheLevel.SOURCE
 
     # ------------------------------------------------------------
     # 写入缓存（主动写入，非读穿透）
@@ -579,22 +671,21 @@ class LayeredCache:
     # 统计信息
     # ------------------------------------------------------------
     def get_stats(self) -> Dict[str, Any]:
-        """获取完整统计信息"""
+        """获取完整统计信息
+
+        注意：overall 统计为请求级计数，即每次 get / get_with_level 调用计为一次访问，
+        即使触发了多层缓存查询也不会重复计数，确保命中率准确反映用户视角。
+        """
         with self._lock:
             local_stats = self._local.get_stats()
             shared_stats = self._shared.get_stats()
 
-            total_accesses = local_stats.accesses + shared_stats.accesses
-            total_hits = local_stats.hits + shared_stats.hits
-            total_misses = local_stats.misses + shared_stats.misses
-            overall_hit_rate = (total_hits / total_accesses) if total_accesses > 0 else 0.0
-
             return {
                 "overall": {
-                    "accesses": total_accesses,
-                    "hits": total_hits,
-                    "misses": total_misses,
-                    "hit_rate": overall_hit_rate,
+                    "accesses": self._request_stats.accesses,
+                    "hits": self._request_stats.hits,
+                    "misses": self._request_stats.misses,
+                    "hit_rate": self._request_stats.hit_rate,
                     "sets": local_stats.sets + shared_stats.sets,
                     "invalidations": local_stats.invalidations + shared_stats.invalidations,
                     "evictions": local_stats.evictions + shared_stats.evictions,
@@ -614,6 +705,7 @@ class LayeredCache:
             self._local.reset_stats()
             self._shared.reset_stats()
             self._stats_loader_calls = 0
+            self._request_stats = CacheStats()
 
     # ------------------------------------------------------------
     # 其他辅助

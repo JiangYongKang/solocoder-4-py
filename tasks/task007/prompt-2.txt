@@ -1,0 +1,7 @@
+你实现的模块初始化依赖图功能模块存在一些问题，需要修复：
+1. detect_cycles 方法未能检测模块依赖自身的自循环依赖：当模块的依赖列表中包含自身时，因环检测的路径长度条件排除了自环，detect_cycles 返回空列表，但 sort 方法随后抛出 CircularDependencyError，导致异常报告中 cycles 字段为空，与错误信息矛盾。需要对自指边进行专项检测并在循环列表中明确报告。
+2. RetryLimitExceededError 异常类已在 exceptions.py 中定义和导出，但在 initializer.py 的 retry_module 方法中从未被 raise，重试达到上限仅以模块状态 FAILED 静默表现。调用方无法通过异常捕获判断重试是否已达硬性上限，文档描述与实现行为脱节。需要在重试循环结束且全部尝试失败后真正抛出该异常或明确文档说明当前设计意图。
+3. retry_module 方法中每次重试时将 attempts 计数器重置为零，首次执行尝试的计数被丢弃，ModuleProgress 只反映最近一次重试的局部计数。运维人员无法获知模块的累计尝试次数，排障缺少整体视角。需要保留跨重试周期的累积计数或同时记录局部和全局尝试次数。
+4. 修复后需要为该模块补充自循环依赖检测、重试上限异常抛出和跨周期 attempt 累计的单元测试，并修正 test_detect_self_loop 测试以反映正确的自循环检测行为。
+5. 更新 README.md 说明修复后的循环依赖检测规则、重试异常抛出的语义和 attempt 计数规则。
+6. 重新运行 poetry run pytest tests/module_init_graph/ -q，需要让所有测试通过。

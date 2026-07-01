@@ -275,10 +275,36 @@ class TestRequestSnapshotCache:
         params = {"id": 123}
 
         cache.set(params, "result1", data_entities=["users"])
+        entry1 = cache.get_entry(params, data_entities=["users"])
+        assert entry1.data_entities == ["users"]
+
         cache.set(params, "result2", data_entities=["orders"])
 
-        assert cache.get(params, data_entities=["users"]) == "result1"
+        # 现在缓存键仅由参数决定，第二次 set 覆盖第一次的结果和依赖
+        assert cache.get(params, data_entities=["users"]) == "result2"
         assert cache.get(params, data_entities=["orders"]) == "result2"
+
+        entry2 = cache.get_entry(params)
+        assert entry2.data_entities == ["orders"]
+        assert len(cache) == 1
+
+    def test_same_params_entities_order_independent(self):
+        from solocoder_4_py.request_snapshot_cache import CacheKeyGenerator
+
+        gen = CacheKeyGenerator()
+        params = {"id": 123}
+        key1 = gen.generate(params, ["users", "orders"])
+        key2 = gen.generate(params, ["orders", "users"])
+        assert key1 == key2
+
+    def test_cache_key_independent_of_entities(self):
+        from solocoder_4_py.request_snapshot_cache import CacheKeyGenerator
+
+        gen = CacheKeyGenerator()
+        params = {"id": 123}
+        key_no_entities = gen.generate(params, None)
+        key_with_entities = gen.generate(params, ["users", "orders"])
+        assert key_no_entities == key_with_entities
 
     def test_invalidation_stat(self):
         cache = RequestSnapshotCache()
@@ -326,8 +352,13 @@ class TestRequestSnapshotCache:
         key1 = cache.set(params, "value1", data_entities=["users"])
         key2 = cache.set(params, "value2", data_entities=["users", "orders"])
 
-        assert key1 != key2
-        assert len(cache) == 2
+        # 现在缓存键仅由参数决定，相同参数生成相同键
+        assert key1 == key2
+        assert len(cache) == 1
+        assert cache.get(params) == "value2"
+
+        entry = cache.get_entry(params)
+        assert set(entry.data_entities) == {"users", "orders"}
 
     def test_get_entry_nonexistent(self):
         cache = RequestSnapshotCache()
@@ -521,3 +552,283 @@ class TestRequestSnapshotCache:
         }
 
         assert cache.get(params_reordered) == result
+
+    def test_version_race_window_get_or_compute(self):
+        cache = RequestSnapshotCache()
+        params = {"id": 123}
+        call_count = [0]
+
+        def compute_and_bump():
+            call_count[0] += 1
+            cache.bump_entity_version("users")
+            return {"name": "Alice"}
+
+        result = cache.get_or_compute(
+            params, compute_and_bump, data_entities=["users"]
+        )
+
+        assert result == {"name": "Alice"}
+        assert call_count[0] == 1
+
+        assert cache.get(params, data_entities=["users"]) is None
+
+        entry = cache.get_entry(params)
+        assert entry is None
+
+        stats = cache.get_stats()
+        assert stats["version_race_detected"] == 1
+
+    def test_version_race_no_false_positive(self):
+        cache = RequestSnapshotCache()
+        params = {"id": 123}
+        call_count = [0]
+
+        def compute_normal():
+            call_count[0] += 1
+            return {"name": "Bob"}
+
+        result = cache.get_or_compute(
+            params, compute_normal, data_entities=["users"]
+        )
+
+        assert result == {"name": "Bob"}
+        assert call_count[0] == 1
+
+        assert cache.get(params, data_entities=["users"]) == {"name": "Bob"}
+
+        stats = cache.get_stats()
+        assert stats["version_race_detected"] == 0
+
+    def test_version_race_multiple_entities(self):
+        cache = RequestSnapshotCache()
+        params = {"query": "complex"}
+
+        def compute_with_one_bump():
+            cache.bump_entity_version("orders")
+            return {"data": "result"}
+
+        result = cache.get_or_compute(
+            params, compute_with_one_bump, data_entities=["users", "orders", "products"]
+        )
+
+        assert result == {"data": "result"}
+
+        assert cache.get(params, data_entities=["users", "orders", "products"]) is None
+
+        stats = cache.get_stats()
+        assert stats["version_race_detected"] == 1
+
+    def test_invalidate_by_pattern_bumps_entity_versions(self):
+        cache = RequestSnapshotCache()
+
+        cache.set({"type": "admin", "id": 1}, {"name": "A"}, data_entities=["users"])
+        cache.set({"type": "admin", "id": 2}, {"name": "B"}, data_entities=["users"])
+        cache.set({"type": "user", "id": 3}, {"name": "C"}, data_entities=["users"])
+
+        initial_version = cache.get_entity_version("users")
+
+        invalidated = cache.invalidate_by_pattern(
+            lambda p: p.get("type") == "admin"
+        )
+        assert invalidated == 2
+
+        new_version = cache.get_entity_version("users")
+        assert new_version == initial_version + 1
+
+        remaining = cache.get({"type": "user", "id": 3}, data_entities=["users"])
+        assert remaining is None
+
+    def test_invalidate_by_pattern_consistency_with_entity_invalidate(self):
+        cache = RequestSnapshotCache()
+
+        cache.set({"category": "A", "id": 1}, "r1", data_entities=["products"])
+        cache.set({"category": "A", "id": 2}, "r2", data_entities=["products"])
+        cache.set({"category": "B", "id": 3}, "r3", data_entities=["products"])
+
+        version_before = cache.get_entity_version("products")
+
+        cache.invalidate_by_pattern(lambda p: p.get("category") == "A")
+
+        version_after_pattern = cache.get_entity_version("products")
+        assert version_after_pattern == version_before + 1
+
+        cache.set({"category": "C", "id": 4}, "r4", data_entities=["products"])
+        cache.set({"category": "D", "id": 5}, "r5", data_entities=["products"])
+
+        cache.invalidate_by_entity("products")
+
+        version_after_entity = cache.get_entity_version("products")
+        assert version_after_entity == version_after_pattern + 1
+
+    def test_invalidate_by_pattern_multiple_entities_bumped(self):
+        cache = RequestSnapshotCache()
+
+        cache.set({"scope": "shared", "u": 1}, {}, data_entities=["users"])
+        cache.set({"scope": "shared", "o": 1}, {}, data_entities=["orders"])
+        cache.set({"scope": "shared", "p": 1}, {}, data_entities=["products"])
+        cache.set({"scope": "private", "x": 1}, {}, data_entities=["logs"])
+
+        u_ver_before = cache.get_entity_version("users")
+        o_ver_before = cache.get_entity_version("orders")
+        p_ver_before = cache.get_entity_version("products")
+        l_ver_before = cache.get_entity_version("logs")
+
+        invalidated = cache.invalidate_by_pattern(
+            lambda p: p.get("scope") == "shared"
+        )
+        assert invalidated == 3
+
+        u_ver_after = cache.get_entity_version("users")
+        o_ver_after = cache.get_entity_version("orders")
+        p_ver_after = cache.get_entity_version("products")
+        l_ver_after = cache.get_entity_version("logs")
+
+        assert u_ver_after == u_ver_before + 1
+        assert o_ver_after == o_ver_before + 1
+        assert p_ver_after == p_ver_before + 1
+        assert l_ver_after == l_ver_before
+
+    def test_ttl_lazy_cleanup_on_has(self):
+        cache = RequestSnapshotCache(default_ttl=0.1)
+
+        cache.set({"id": 1}, "value1")
+        cache.set({"id": 2}, "value2")
+
+        assert cache.has({"id": 1}) is True
+        assert cache.has({"id": 2}) is True
+
+        time.sleep(0.15)
+
+        assert cache.has({"id": 1}) is False
+        assert cache.has({"id": 2}) is False
+
+        stats = cache.get_stats()
+        assert stats["ttl_cleanups"] >= 2
+
+    def test_ttl_lazy_cleanup_on_len(self):
+        cache = RequestSnapshotCache(default_ttl=0.1)
+
+        cache.set({"a": 1}, "v1")
+        cache.set({"a": 2}, "v2")
+        cache.set({"a": 3}, "v3")
+        assert len(cache) == 3
+
+        time.sleep(0.15)
+
+        assert len(cache) == 0
+
+    def test_ttl_lazy_cleanup_on_contains(self):
+        cache = RequestSnapshotCache(default_ttl=0.1)
+
+        cache.set({"key": "x"}, "val")
+        assert {"key": "x"} in cache
+
+        time.sleep(0.15)
+
+        assert {"key": "x"} not in cache
+
+    def test_ttl_lazy_cleanup_on_get_stats(self):
+        cache = RequestSnapshotCache(default_ttl=0.1)
+
+        cache.set({"q": 1}, "r1")
+        cache.set({"q": 2}, "r2")
+
+        stats_before = cache.get_stats()
+        assert stats_before["size"] == 2
+
+        time.sleep(0.15)
+
+        stats_after = cache.get_stats()
+        assert stats_after["size"] == 0
+        assert stats_after["ttl_cleanups"] >= 2
+
+    def test_ttl_lazy_cleanup_on_get_entry(self):
+        cache = RequestSnapshotCache(default_ttl=0.1)
+
+        cache.set({"e": 1}, "data")
+        assert cache.get_entry({"e": 1}) is not None
+
+        time.sleep(0.15)
+
+        assert cache.get_entry({"e": 1}) is None
+
+    def test_ttl_lazy_cleanup_on_set(self):
+        cache = RequestSnapshotCache(default_ttl=0.1)
+
+        cache.set({"s1": 1}, "v1")
+        cache.set({"s2": 2}, "v2")
+        assert len(cache) == 2
+
+        time.sleep(0.15)
+
+        cache.set({"s3": 3}, "v3")
+
+        stats = cache.get_stats()
+        assert stats["ttl_cleanups"] >= 2
+        assert len(cache) == 1
+
+    def test_ttl_lazy_cleanup_on_invalidate_methods(self):
+        cache = RequestSnapshotCache(default_ttl=0.1)
+
+        cache.set({"inv": 1}, "v1", data_entities=["items"])
+        cache.set({"inv": 2}, "v2", data_entities=["items"])
+        assert len(cache) == 2
+
+        time.sleep(0.15)
+
+        cache.invalidate_by_entity("items")
+
+        stats = cache.get_stats()
+        assert stats["ttl_cleanups"] >= 1
+
+    def test_ttl_cleanup_preserves_valid_entries(self):
+        cache = RequestSnapshotCache(default_ttl=10)
+
+        cache.set({"keep": 1}, "valid1")
+        cache.set({"keep": 2}, "valid2")
+
+        stats = cache.get_stats()
+        assert stats["size"] == 2
+        assert stats["ttl_cleanups"] == 0
+
+        assert cache.has({"keep": 1}) is True
+        assert cache.has({"keep": 2}) is True
+
+        stats2 = cache.get_stats()
+        assert stats2["size"] == 2
+        assert stats2["ttl_cleanups"] == 0
+
+    def test_no_ttl_no_cleanup_triggered(self):
+        cache = RequestSnapshotCache(default_ttl=None)
+
+        cache.set({"x": 1}, "v1")
+        cache.set({"x": 2}, "v2")
+
+        time.sleep(0.05)
+
+        assert len(cache) == 2
+        assert cache.has({"x": 1}) is True
+        stats = cache.get_stats()
+        assert stats["ttl_cleanups"] == 0
+        assert stats["size"] == 2
+
+    def test_get_or_compute_race_result_used_but_not_cached(self):
+        cache = RequestSnapshotCache()
+        params = {"race": "test"}
+        compute_calls = [0]
+
+        def compute_func():
+            compute_calls[0] += 1
+            cache.bump_entity_version("data")
+            return {"computed": True}
+
+        r1 = cache.get_or_compute(params, compute_func, data_entities=["data"])
+        r2 = cache.get_or_compute(params, compute_func, data_entities=["data"])
+
+        assert r1 == {"computed": True}
+        assert r2 == {"computed": True}
+        assert compute_calls[0] == 2
+
+        stats = cache.get_stats()
+        assert stats["version_race_detected"] == 2
+        assert stats["sets"] == 0

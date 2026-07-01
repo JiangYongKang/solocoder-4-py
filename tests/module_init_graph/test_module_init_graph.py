@@ -302,7 +302,48 @@ class TestTopologyCycleDetection:
     def test_detect_self_loop(self) -> None:
         modules = {"a": ModuleNode("a", dependencies=["a"])}
         report = TopologyAnalyzer.detect_cycles(modules)
-        assert not report.has_cycles
+        assert report.has_cycles
+        assert report.cycle_count == 1
+        assert report.cycles == [["a"]]
+        assert report.involved_modules() == {"a"}
+
+    def test_self_loop_with_independent_modules(self) -> None:
+        modules = {
+            "a": ModuleNode("a", dependencies=["a"]),
+            "b": ModuleNode("b"),
+            "c": ModuleNode("c", dependencies=["b"]),
+        }
+        report = TopologyAnalyzer.detect_cycles(modules)
+        assert report.cycle_count == 1
+        assert report.involved_modules() == {"a"}
+
+    def test_sort_self_loop_raises_with_cycles(self) -> None:
+        modules = {"a": ModuleNode("a", dependencies=["a"])}
+        with pytest.raises(CircularDependencyError) as excinfo:
+            TopologyAnalyzer.sort(modules)
+        exc = excinfo.value
+        assert exc.cycles is not None
+        assert ["a"] in exc.cycles
+        assert "a" in str(exc)
+
+    def test_self_loop_in_cycle_report_format(self) -> None:
+        modules = {"a": ModuleNode("a", dependencies=["a"])}
+        report = TopologyAnalyzer.detect_cycles(modules)
+        formatted = report.format_report()
+        assert "检测到 1 个循环依赖" in formatted
+        assert "a -> a" in formatted
+        assert "涉及模块: a" in formatted
+
+    def test_mixed_self_loop_and_regular_cycle(self) -> None:
+        modules = {
+            "a": ModuleNode("a", dependencies=["a"]),
+            "b": ModuleNode("b", dependencies=["c"]),
+            "c": ModuleNode("c", dependencies=["b"]),
+        }
+        report = TopologyAnalyzer.detect_cycles(modules)
+        assert report.cycle_count == 2
+        assert report.involved_modules() == {"a", "b", "c"}
+        assert ["a"] in report.cycles
 
     def test_detect_multiple_cycles(self) -> None:
         modules = {
@@ -465,11 +506,24 @@ class TestModuleProgress:
         mp.mark_initializing(clock)
         mp.mark_failed(ValueError("x"), 0.1, clock)
         assert mp.is_terminal()
+        assert mp.attempts == 1
         mp.reset_for_retry()
         assert mp.state == ModuleState.PENDING
         assert mp.error_message == ""
         assert mp.init_result is None
         assert mp.duration_seconds == 0.0
+        assert mp.attempts == 1
+
+    def test_reset_for_retry_preserves_multiple_attempts(self) -> None:
+        clock = FakeClock()
+        mp = ModuleProgress(module_id="m1")
+        for _ in range(5):
+            mp.mark_initializing(clock)
+        assert mp.attempts == 5
+        mp.reset_for_retry()
+        assert mp.attempts == 5
+        mp.mark_initializing(clock)
+        assert mp.attempts == 6
 
     def test_multiple_initializing_increments_attempts(self) -> None:
         clock = FakeClock()
@@ -869,7 +923,7 @@ class TestInitializerRetry:
         assert prog.module_progress["b"].state == ModuleState.ISOLATED
         assert "b" not in tracker.call_count
 
-    def test_retry_failed_module_still_fails(self, tracker) -> None:
+    def test_retry_failed_module_still_fails_raises(self, tracker) -> None:
         init = ModuleInitializer()
         rid = init.create_init_run()
         ma = ModuleNode("a")
@@ -879,10 +933,57 @@ class TestInitializerRetry:
         init.register_modules(rid, [ma, mb])
         init.execute_init(rid)
 
-        prog = init.retry_module(rid, "a", extra_retries=1)
+        with pytest.raises(RetryLimitExceededError) as excinfo:
+            init.retry_module(rid, "a", extra_retries=1)
+
+        err_msg = str(excinfo.value)
+        assert "a" in err_msg
+        assert "共尝试 3 次" in err_msg
+        assert "ValueError" in err_msg or "still broken" in err_msg
+
+        prog = init.get_progress(rid)
         assert prog.module_progress["a"].state == ModuleState.FAILED
         assert prog.module_progress["b"].state == ModuleState.ISOLATED
         assert tracker.call_count["a"] == 3
+        assert prog.module_progress["a"].attempts == 3
+
+    def test_retry_limit_exception_has_module_id(self, tracker) -> None:
+        init = ModuleInitializer()
+        rid = init.create_init_run()
+        m = ModuleNode("svc:payments")
+        m.set_init_callback(tracker.make_failing_init("svc:payments", RuntimeError("x")))
+        init.register_module(rid, m)
+        init.execute_init(rid)
+
+        with pytest.raises(RetryLimitExceededError) as excinfo:
+            init.retry_module(rid, "svc:payments", extra_retries=0)
+        assert "svc:payments" in str(excinfo.value)
+
+    def test_attempts_accumulate_across_retry_cycles(self, tracker) -> None:
+        init = ModuleInitializer()
+        rid = init.create_init_run()
+        ma = ModuleNode("a")
+        ma.set_init_callback(tracker.make_failing_init("a", RuntimeError("err")))
+        init.register_module(rid, ma)
+        init.execute_init(rid)
+
+        prog1 = init.get_module_progress(rid, "a")
+        attempts_after_execute = prog1.attempts
+        assert attempts_after_execute == 1
+
+        try:
+            init.retry_module(rid, "a", extra_retries=0)
+        except RetryLimitExceededError:
+            pass
+        prog2 = init.get_module_progress(rid, "a")
+        assert prog2.attempts == attempts_after_execute + 1
+
+        try:
+            init.retry_module(rid, "a", extra_retries=2)
+        except RetryLimitExceededError:
+            pass
+        prog3 = init.get_module_progress(rid, "a")
+        assert prog3.attempts == 1 + 1 + 3
 
     def test_retry_all_failed(self, tracker) -> None:
         init = ModuleInitializer()

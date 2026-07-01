@@ -1,4 +1,5 @@
 from collections import deque
+import heapq
 from typing import Dict, List
 
 from .exceptions import CircularDependencyError, DependencyNotFoundError
@@ -10,14 +11,17 @@ class TopologySorter:
 
     基于 Kahn 算法对有向无环图 (DAG) 进行拓扑排序，
     用于确定预热任务的执行顺序。
+    同层级（入度相同）的任务按 priority 降序执行，确保高优先级热点数据优先预热。
     """
 
     @staticmethod
     def sort(tasks: Dict[str, WarmupTask]) -> List[str]:
         """对任务图进行拓扑排序
 
+        使用最小堆（负 priority）实现按 priority 降序选择同层级任务。
+
         :param tasks: 任务字典 {task_id: WarmupTask}
-        :returns: 按依赖顺序排列的 task_id 列表
+        :returns: 按依赖顺序 + priority 降序排列的 task_id 列表
         :raises CircularDependencyError: 存在循环依赖
         :raises DependencyNotFoundError: 依赖的任务不存在
         """
@@ -39,19 +43,21 @@ class TopologySorter:
                 in_degree[task_id] += 1
                 out_edges[dep].append(task_id)
 
-        queue: deque = deque()
+        heap: List[tuple] = []
         for task_id, degree in in_degree.items():
             if degree == 0:
-                queue.append(task_id)
+                priority = tasks[task_id].priority
+                heapq.heappush(heap, (-priority, task_id))
 
         result: List[str] = []
-        while queue:
-            current = queue.popleft()
+        while heap:
+            _, current = heapq.heappop(heap)
             result.append(current)
             for neighbor in out_edges[current]:
                 in_degree[neighbor] -= 1
                 if in_degree[neighbor] == 0:
-                    queue.append(neighbor)
+                    priority = tasks[neighbor].priority
+                    heapq.heappush(heap, (-priority, neighbor))
 
         if len(result) != len(tasks):
             remaining = set(tasks.keys()) - set(result)

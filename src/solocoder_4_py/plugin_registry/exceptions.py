@@ -49,3 +49,20 @@ class PluginStateError(PluginRegistryError):
         super().__init__(
             f"插件 '{plugin_id}' 当前状态为 '{current_status}'，无法执行操作 '{operation}'"
         )
+
+
+class PluginDependencyError(PluginRegistryError):
+    """插件依赖不满足异常"""
+
+    def __init__(
+        self,
+        plugin_id: str,
+        dependency_id: str,
+        reason: str,
+    ) -> None:
+        self.plugin_id = plugin_id
+        self.dependency_id = dependency_id
+        self.reason = reason
+        super().__init__(
+            f"插件 '{plugin_id}' 的依赖 '{dependency_id}' 不满足: {reason}"
+        )

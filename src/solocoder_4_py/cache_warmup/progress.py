@@ -76,6 +76,8 @@ class WarmupProgress:
 
     @property
     def progress_percentage(self) -> float:
+        if self.state == WarmupState.NOT_STARTED:
+            return 0.0
         if self.total_tasks == 0:
             return 100.0
         done = self.completed_tasks + self.failed_tasks + self.skipped_tasks

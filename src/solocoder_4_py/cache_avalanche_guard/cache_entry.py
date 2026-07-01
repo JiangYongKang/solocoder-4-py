@@ -15,6 +15,7 @@ class CacheEntry:
         state: 缓存条目状态
         created_at: 创建时间戳
         expires_at: 过期时间戳
+        original_ttl: 原始 TTL（秒），不含抖动，用于续期时继承
         accessed_at: 最后访问时间戳
         hit_count: 命中次数
         access_timestamps: 访问时间戳列表，用于热点键检测
@@ -30,6 +31,7 @@ class CacheEntry:
     state: CacheEntryState = CacheEntryState.VALID
     created_at: float = field(default_factory=time.time)
     expires_at: Optional[float] = None
+    original_ttl: Optional[float] = None
     accessed_at: float = field(default_factory=time.time)
     hit_count: int = 0
     access_timestamps: List[float] = field(default_factory=list)
@@ -109,10 +111,18 @@ class CacheEntry:
         self.rebuild_attempts += 1
         self.last_rebuild_at = time.time()
 
-    def mark_rebuilt(self, value: Any, expires_at: float) -> None:
-        """标记为重建完成"""
+    def mark_rebuilt(self, value: Any, expires_at: float, original_ttl: Optional[float] = None) -> None:
+        """标记为重建完成
+
+        Args:
+            value: 新的缓存值
+            expires_at: 新的过期时间戳
+            original_ttl: 原始 TTL（秒），用于续期时继承
+        """
         self.value = value
         self.expires_at = expires_at
+        if original_ttl is not None:
+            self.original_ttl = original_ttl
         self.state = CacheEntryState.VALID
         self.degraded_value = None
         self.degraded_at = None
@@ -141,6 +151,7 @@ class CacheEntry:
             "state": self.state.value,
             "created_at": self.created_at,
             "expires_at": self.expires_at,
+            "original_ttl": self.original_ttl,
             "accessed_at": self.accessed_at,
             "hit_count": self.hit_count,
             "access_timestamps": list(self.access_timestamps),
@@ -160,6 +171,7 @@ class CacheEntry:
             state=CacheEntryState(data.get("state", CacheEntryState.VALID.value)),
             created_at=data.get("created_at", time.time()),
             expires_at=data.get("expires_at"),
+            original_ttl=data.get("original_ttl"),
             accessed_at=data.get("accessed_at", time.time()),
             hit_count=data.get("hit_count", 0),
             access_timestamps=list(data.get("access_timestamps", [])),

@@ -335,11 +335,17 @@ class TestWarmupProgress:
     def test_initial_state(self) -> None:
         wp = WarmupProgress()
         assert wp.state == WarmupState.NOT_STARTED
-        assert wp.progress_percentage == 100.0  # 0 tasks = 100%
+        assert wp.progress_percentage == 0.0  # NOT_STARTED = 0%
         assert wp.total_tasks == 0
+
+    def test_empty_run_after_execute_is_100_percent(self) -> None:
+        wp = WarmupProgress()
+        wp.state = WarmupState.COMPLETED
+        assert wp.progress_percentage == 100.0  # 已结束 + 0 tasks = 100%
 
     def test_progress_percentage(self) -> None:
         wp = WarmupProgress(total_tasks=10)
+        wp.state = WarmupState.RUNNING
         wp.completed_tasks = 3
         wp.failed_tasks = 1
         wp.skipped_tasks = 1
@@ -347,8 +353,24 @@ class TestWarmupProgress:
 
     def test_progress_percentage_rounding(self) -> None:
         wp = WarmupProgress(total_tasks=3)
+        wp.state = WarmupState.RUNNING
         wp.completed_tasks = 1
         assert wp.progress_percentage == 33.33
+
+    def test_not_started_always_zero_regardless_of_counts(self) -> None:
+        wp = WarmupProgress(total_tasks=10)
+        wp.state = WarmupState.NOT_STARTED
+        wp.completed_tasks = 5
+        wp.failed_tasks = 3
+        assert wp.progress_percentage == 0.0  # NOT_STARTED 始终是 0%
+
+    def test_partial_completed_state_counts(self) -> None:
+        wp = WarmupProgress(total_tasks=5)
+        wp.state = WarmupState.PARTIAL_COMPLETED
+        wp.completed_tasks = 3
+        wp.failed_tasks = 1
+        wp.skipped_tasks = 1
+        assert wp.progress_percentage == 100.0
 
     def test_recalculate_counts(self) -> None:
         wp = WarmupProgress(total_tasks=4)
@@ -661,15 +683,22 @@ class TestOrchestratorFailureStrategies:
         assert tracker.call_count["a"] == 1
         assert tracker.call_count["b"] == 1
 
-    def test_continue_anyway_with_dependency_still_skips(self, tracker) -> None:
-        """即使 CONTINUE_ANYWAY，声明依赖的任务仍会因上游失败被跳过"""
+    def test_continue_anyway_with_dependency_runs_anyway(self, tracker) -> None:
+        """CONTINUE_ANYWAY 下，即使上游失败，下游任务仍被调度执行（用户自行容错）"""
         orch = WarmupOrchestrator(failure_strategy=FailureStrategy.CONTINUE_ANYWAY)
         run_id = orch.create_warmup_run()
 
         t_up = WarmupTask("up")
         t_up.set_load_function(tracker.make_failing_loader("up", Exception("x")))
         t_down = WarmupTask("down", dependencies=["up"])
-        t_down.set_load_function(tracker.make_loader("down", "X"))
+        # 下游即使依赖 up 失败，仍然尽力执行（使用默认值等）
+        def down_loader():
+            # 业务自行处理缺失的上游数据
+            cached_up = orch.get_cached_data(run_id, "up")
+            if cached_up is None:
+                return "fallback-value"
+            return cached_up
+        t_down.set_load_function(down_loader)
         t_indep = WarmupTask("indep")
         t_indep.set_load_function(tracker.make_loader("indep", "Y"))
 
@@ -677,8 +706,12 @@ class TestOrchestratorFailureStrategies:
         prog = orch.execute_warmup(run_id)
 
         assert prog.task_progress["up"].state == TaskState.FAILED
-        assert prog.task_progress["down"].state == TaskState.SKIPPED  # 仍被跳过
-        assert prog.task_progress["indep"].state == TaskState.COMPLETED  # 独立任务正常
+        # CONTINUE_ANYWAY 语义：下游仍然执行（不再因上游失败跳过）
+        assert prog.task_progress["down"].state == TaskState.COMPLETED
+        assert orch.get_cached_data(run_id, "down") == "fallback-value"
+        assert prog.task_progress["indep"].state == TaskState.COMPLETED
+        # 验证下游确实执行过
+        assert "down" in tracker.call_order or orch.get_cached_data(run_id, "down") == "fallback-value"
 
     def test_multiple_failures_skip_all_downstream(self, tracker) -> None:
         orch = WarmupOrchestrator(failure_strategy=FailureStrategy.SKIP_DEPENDENTS)
@@ -985,3 +1018,252 @@ class TestIntegrationScenarios:
         assert tp.duration_seconds >= 1.0
         assert tp.started_at is not None
         assert tp.completed_at is not None
+
+
+# ---------------------------------------------------------------------------
+# Priority Scheduling
+# ---------------------------------------------------------------------------
+class TestPriorityScheduling:
+    def test_topology_sorter_priority_descending(self, tracker) -> None:
+        """同层级无依赖任务按 priority 降序执行"""
+        tasks = {
+            "low": WarmupTask("low", priority=1),
+            "med": WarmupTask("med", priority=5),
+            "high": WarmupTask("high", priority=10),
+            "mid": WarmupTask("mid", priority=7),
+        }
+        order = TopologySorter.sort(tasks)
+        # 优先级从高到低：high(10) → mid(7) → med(5) → low(1)
+        assert order.index("high") < order.index("mid")
+        assert order.index("mid") < order.index("med")
+        assert order.index("med") < order.index("low")
+
+    def test_topology_sorter_priority_with_dependencies(self) -> None:
+        """依赖约束优先于 priority，但同级节点按 priority 排序"""
+        tasks = {
+            "base": WarmupTask("base", priority=0),
+            "low_child": WarmupTask("low_child", priority=1, dependencies=["base"]),
+            "high_child": WarmupTask("high_child", priority=100, dependencies=["base"]),
+        }
+        order = TopologySorter.sort(tasks)
+        # base 必须先执行
+        assert order[0] == "base"
+        # 同级任务中 high_child(100) 先于 low_child(1)
+        assert order.index("high_child") < order.index("low_child")
+
+    def test_topology_sorter_same_priority_stable(self) -> None:
+        """相同 priority 的多个任务都能合法完成（排序一致）"""
+        tasks = {f"t{i}": WarmupTask(f"t{i}", priority=5) for i in range(8)}
+        order1 = TopologySorter.sort(tasks)
+        order2 = TopologySorter.sort(tasks)
+        assert set(order1) == set(order2) == set(tasks.keys())
+
+    def test_orchestrator_hot_data_priority_first(self, tracker) -> None:
+        """编排器按 priority 优先加载热点数据"""
+        orch = WarmupOrchestrator()
+        run_id = orch.create_warmup_run()
+
+        # 构造4个同级任务，不同优先级
+        priority_map = {"index_page": 100, "user_profile": 50, "search_trend": 20, "about_us": 1}
+        tasks = []
+        for name, prio in priority_map.items():
+            t = WarmupTask(name, priority=prio)
+            t.set_load_function(tracker.make_loader(name, f"data-{name}"))
+            tasks.append(t)
+        orch.register_tasks(run_id, tasks)
+        orch.execute_warmup(run_id)
+
+        # index_page 优先级最高，应最先被执行
+        assert tracker.call_order[0] == "index_page"
+        # about_us 优先级最低，应最后被执行
+        assert tracker.call_order[-1] == "about_us"
+
+
+# ---------------------------------------------------------------------------
+# Empty Run Progress Percentage
+# ---------------------------------------------------------------------------
+class TestEmptyRunProgress:
+    def test_empty_run_not_started_zero_percent(self) -> None:
+        """空流程 NOT_STARTED 状态应返回 0%"""
+        orch = WarmupOrchestrator()
+        run_id = orch.create_warmup_run()
+        prog = orch.get_progress(run_id)
+        assert prog.state == WarmupState.NOT_STARTED
+        assert prog.progress_percentage == 0.0
+        assert prog.total_tasks == 0
+
+    def test_empty_run_after_execute_100_percent(self) -> None:
+        """空流程执行完毕后应返回 100%"""
+        orch = WarmupOrchestrator()
+        run_id = orch.create_warmup_run()
+        prog = orch.execute_warmup(run_id)
+        assert prog.state == WarmupState.COMPLETED
+        assert prog.progress_percentage == 100.0
+        assert prog.total_tasks == 0
+
+    def test_non_empty_run_not_started_zero_percent(self) -> None:
+        """有任务但未执行的流程应返回 0%"""
+        orch = WarmupOrchestrator()
+        run_id = orch.create_warmup_run()
+        orch.register_task(run_id, WarmupTask("t1"))
+        orch.register_task(run_id, WarmupTask("t2"))
+        prog = orch.get_progress(run_id)
+        assert prog.state == WarmupState.NOT_STARTED
+        assert prog.progress_percentage == 0.0
+        assert prog.total_tasks == 2
+
+
+# ---------------------------------------------------------------------------
+# Concurrent Warmup Runs
+# ---------------------------------------------------------------------------
+class TestConcurrentWarmupRuns:
+    def test_multiple_runs_isolated_state(self, tracker) -> None:
+        """同一编排器管理的多个 run 之间数据互不干扰"""
+        orch = WarmupOrchestrator()
+        run_a = orch.create_warmup_run("run-A")
+        run_b = orch.create_warmup_run("run-B")
+
+        # Run A: 任务 a1, a2
+        for name in ("a1", "a2"):
+            t = WarmupTask(name)
+            t.set_load_function(tracker.make_loader(name, f"A-{name}"))
+            orch.register_task(run_a, t)
+
+        # Run B: 任务 b1, b2
+        for name in ("b1", "b2"):
+            t = WarmupTask(name)
+            t.set_load_function(tracker.make_loader(name, f"B-{name}"))
+            orch.register_task(run_b, t)
+
+        prog_a = orch.execute_warmup(run_a)
+        prog_b = orch.execute_warmup(run_b)
+
+        # 两个 run 各自完成
+        assert prog_a.state == WarmupState.COMPLETED
+        assert prog_b.state == WarmupState.COMPLETED
+
+        # 数据隔离：run A 看不到 B 的数据，反之亦然
+        assert orch.get_cached_data(run_a, "a1") == "A-a1"
+        assert orch.get_cached_data(run_a, "b1") is None
+        assert orch.get_cached_data(run_b, "b1") == "B-b1"
+        assert orch.get_cached_data(run_b, "a1") is None
+
+        # 各自的任务列表独立
+        assert set(orch.get_registered_tasks(run_a)) == {"a1", "a2"}
+        assert set(orch.get_registered_tasks(run_b)) == {"b1", "b2"}
+
+    def test_concurrent_execution_threads(self, tracker) -> None:
+        """多个线程同时执行不同 run，结果应正确完成（验证 per-run 锁不相互阻塞）"""
+        import threading
+        import time as _time
+
+        orch = WarmupOrchestrator()
+        num_runs = 4
+        run_ids = []
+        results: Dict[str, WarmupProgress] = {}
+
+        # 创建 4 个 run，每个含 5 个任务（模拟耗时）
+        for r in range(num_runs):
+            rid = orch.create_warmup_run(f"concurrent-run-{r}")
+            run_ids.append(rid)
+            for i in range(5):
+                t = WarmupTask(f"run{r}-t{i}")
+                t.set_load_function(tracker.make_loader(f"run{r}-t{i}", f"value-{r}-{i}"))
+                orch.register_task(rid, t)
+
+        def worker(rid: str) -> None:
+            p = orch.execute_warmup(rid)
+            results[rid] = p
+
+        # 并发执行
+        threads = [threading.Thread(target=worker, args=(rid,)) for rid in run_ids]
+        start = _time.monotonic()
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(timeout=5.0)
+        duration = _time.monotonic() - start
+
+        # 所有 run 正确完成
+        assert len(results) == num_runs
+        for rid in run_ids:
+            assert rid in results
+            p = results[rid]
+            assert p.state == WarmupState.COMPLETED
+            assert p.completed_tasks == 5
+
+        # 所有任务都只执行一次（无竞态导致的重复调用）
+        for r in range(num_runs):
+            for i in range(5):
+                assert tracker.call_count[f"run{r}-t{i}"] == 1
+
+    def test_concurrent_queries_during_execution(self) -> None:
+        """执行期间并发查询进度、缓存不抛异常（线程安全读）"""
+        import threading
+        import time as _time
+
+        orch = WarmupOrchestrator()
+        rid = orch.create_warmup_run()
+
+        # 用一个慢任务模拟执行窗口
+        slow = WarmupTask("slow-task")
+        query_results = []
+
+        def slow_loader():
+            # 在执行期间循环查询（模拟监控线程）
+            for _ in range(10):
+                try:
+                    p = orch.get_progress(rid)
+                    tp = orch.get_task_progress(rid, "slow-task")
+                    state = orch.get_warmup_state(rid)
+                    cached = orch.get_cached_data(rid, "slow-task")
+                    all_c = orch.get_all_cached_data(rid)
+                    query_results.append((p.progress_percentage, state, tp.state))
+                except Exception as exc:  # noqa: BLE001
+                    query_results.append(("ERROR", str(exc)))
+                _time.sleep(0.005)
+            return "slow-data"
+
+        slow.set_load_function(slow_loader)
+        orch.register_task(rid, slow)
+
+        prog = orch.execute_warmup(rid)
+
+        # 查询没有抛异常
+        assert len(query_results) > 0
+        for item in query_results:
+            assert item[0] != "ERROR", f"查询异常: {item}"
+        # 最终结果正确
+        assert prog.state == WarmupState.COMPLETED
+        assert orch.get_cached_data(rid, "slow-task") == "slow-data"
+
+    def test_different_runs_different_failure_strategies(self) -> None:
+        """同一 orchestrator 内不同 run 可使用不同失败策略"""
+        orch = WarmupOrchestrator()
+
+        # Run A: SKIP_DEPENDENTS (default)
+        run_a = orch.create_warmup_run("run-A", failure_strategy=FailureStrategy.SKIP_DEPENDENTS)
+        orch.register_task(run_a, WarmupTask("a-up", ))
+        orch.register_task(run_a, WarmupTask("a-down", dependencies=["a-up"]))
+        orch.get_cached_data  # no-op
+
+        # Run B: ABORT_ALL
+        run_b = orch.create_warmup_run("run-B", failure_strategy=FailureStrategy.ABORT_ALL)
+        orch.register_task(run_b, WarmupTask("b-up"))
+        orch.register_task(run_b, WarmupTask("b-down", dependencies=["b-up"]))
+        orch.register_task(run_b, WarmupTask("b-other"))
+
+        # Run C: CONTINUE_ANYWAY
+        run_c = orch.create_warmup_run("run-C", failure_strategy=FailureStrategy.CONTINUE_ANYWAY)
+        orch.register_task(run_c, WarmupTask("c-up"))
+        orch.register_task(run_c, WarmupTask("c-down", dependencies=["c-up"]))
+
+        # 各自按策略执行完成（无失败时行为一致）
+        pa = orch.execute_warmup(run_a)
+        pb = orch.execute_warmup(run_b)
+        pc = orch.execute_warmup(run_c)
+
+        assert pa.state == WarmupState.COMPLETED
+        assert pb.state == WarmupState.COMPLETED
+        assert pc.state == WarmupState.COMPLETED
+

@@ -68,7 +68,8 @@ INIT ─▶ PREPARING ─┬─▶ PREPARED ──▶ COMMITTING ──▶ COMMI
 
 ### 3.2 Prepare 阶段超时
 - **现象**：从 `prepare_started_at` 计时，超过 `prepare_timeout_seconds` 仍未收集到所有 YES
-- **协调器动作**：决策 `TIMEOUT_ABORTED`，对所有已响应的参与者调用 `abort`
+- **协调器动作**：决策 `TIMEOUT_ABORTED`，`prepare_transaction` 抛出 `TimeoutDecisionAbortedError`，由调用者或 `execute_transaction` 触发 abort 流程
+- **`execute_transaction` 行为**：捕获 `TimeoutDecisionAbortedError` 并自动执行 `abort_transaction`，最终事务状态为 `TIMEOUT_ABORTED`
 - **可测试性**：通过 `TransactionCoordinator(clock=FakeClock())` 注入可控时钟便于断言
 
 ### 3.3 重复请求（幂等性）

@@ -14,9 +14,12 @@
   - `MANUAL`：手动触发任务，仅在调用 `trigger()` 时执行
 - **运行历史记录**：每次任务执行产生 `TaskRunRecord`，包含开始/结束时间、结果、错误信息、重试次数等
 - **历史查询**：按时间范围、状态、运行 ID 等条件查询历史
-- **可注入时间提供者**：构造时注入自定义 `time_provider`，测试中无需真实等待
+- **可注入时间/睡眠提供者**：构造时注入自定义 `time_provider` / `sleep_provider`，测试中无需真实等待
 - **线程安全**：所有公共操作均使用 `RLock` 保护
-- **重试机制**：支持 `max_retries` 指定失败自动重试次数
+- **重试机制**：支持 `max_retries` 指定失败自动重试次数，可配置 `retry_delay_seconds` 插入重试间隔
+- **handler 超时中断**：使用 `ThreadPoolExecutor + Future.result(timeout)` 实现超时保护，避免卡死调度
+- **周期追赶补偿**：`resume(catch_up=True)` 逐周期补跑暂停期间遗漏的调度，追平后自动复位
+- **触发器竞态防护**：执行前锁内终态二次校验，窗口期 cancel/unregister 一律记录为 SKIPPED 而非误执行
 
 ## 任务类型
 

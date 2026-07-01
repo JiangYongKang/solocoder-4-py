@@ -1185,3 +1185,541 @@ class TestIntegrationScenarios:
         runner.activate("p1")
         info = runner.get_task("p1")
         assert info.next_run_at == pytest.approx(110.0)
+
+
+# =====================================================================
+# handler 超时机制测试
+# =====================================================================
+class TestHandlerTimeout:
+    def test_handler_timeout_produces_failed_record(self):
+        """handler 长时间阻塞应通过 ThreadPoolExecutor 被判定为超时，
+        记录 FAILED，error_type == 'TimeoutError'"""
+        runner = InternalTaskRunner()
+
+        stop_event = threading.Event()
+
+        def never_return(**kw):
+            stop_event.wait(timeout=10)
+            return "never"
+
+        try:
+            runner.register(
+                TaskDefinition(
+                    task_id="slow",
+                    task_type=TaskType.MANUAL,
+                    handler=never_return,
+                    timeout_seconds=0.05,  # 非常短，立即可超时
+                )
+            )
+            runner.activate("slow")
+
+            t0 = time.perf_counter()
+            record = runner.trigger("slow")
+            elapsed = time.perf_counter() - t0
+
+            # 验证基本属性
+            assert record.is_failed
+            assert record.error_type == "TimeoutError"
+            assert record.attempt == 1
+            assert "超时" in (record.error_message or "")
+            # 总体耗时应该接近 timeout，不是真的等 handler 返回
+            assert elapsed < 2.0
+        finally:
+            stop_event.set()
+            runner.shutdown(wait=False)
+
+    def test_handler_no_timeout_runs_normally(self):
+        """未设置 timeout_seconds 的 handler 正常执行（不走 ThreadPoolExecutor）"""
+        runner = InternalTaskRunner()
+
+        def quick(**kw):
+            return 42
+
+        runner.register(
+            TaskDefinition(
+                task_id="fast",
+                task_type=TaskType.MANUAL,
+                handler=quick,
+                timeout_seconds=None,
+            )
+        )
+        runner.activate("fast")
+        r = runner.trigger("fast")
+        assert r.is_success
+        assert r.result == 42
+
+        runner.shutdown(wait=True)
+
+    def test_handler_within_timeout_runs_normally(self):
+        """设置 timeout 但 handler 在时限内返回，正常 SUCCESS"""
+        runner = InternalTaskRunner()
+
+        def quick(**kw):
+            return "ok"
+
+        runner.register(
+            TaskDefinition(
+                task_id="ok",
+                task_type=TaskType.MANUAL,
+                handler=quick,
+                timeout_seconds=10.0,
+            )
+        )
+        runner.activate("ok")
+        r = runner.trigger("ok")
+        assert r.is_success
+        assert r.result == "ok"
+
+        runner.shutdown(wait=True)
+
+
+# =====================================================================
+# 重试延迟机制测试（使用可注入 sleep_provider 避免真实等待）
+# =====================================================================
+class TestRetryDelay:
+    def test_retry_delay_invocations_match_retry_count(self):
+        """max_retries=2 且 retry_delay_seconds=5 时，sleep 应被调用 2 次"""
+        sleep_calls: List[float] = []
+
+        def fake_sleep(sec):
+            sleep_calls.append(sec)
+
+        runner = InternalTaskRunner(sleep_provider=fake_sleep)
+
+        def always_fail(**kw):
+            raise RuntimeError("boom")
+
+        runner.register(
+            TaskDefinition(
+                task_id="f",
+                task_type=TaskType.MANUAL,
+                handler=always_fail,
+                max_retries=2,
+                retry_delay_seconds=5.0,
+            )
+        )
+        runner.activate("f")
+
+        record = runner.trigger("f")
+        assert record.is_failed
+        assert record.attempt == 3  # 1 次初跑 + 2 次重试
+        assert sleep_calls == [5.0, 5.0]
+
+        runner.shutdown(wait=True)
+
+    def test_first_attempt_no_delay(self):
+        """首次执行不触发 sleep"""
+        sleep_calls: List[float] = []
+        runner = InternalTaskRunner(sleep_provider=lambda s: sleep_calls.append(s))
+
+        def once_ok(**kw):
+            return "done"
+
+        runner.register(
+            TaskDefinition(
+                task_id="g",
+                task_type=TaskType.MANUAL,
+                handler=once_ok,
+                max_retries=3,
+                retry_delay_seconds=10.0,
+            )
+        )
+        runner.activate("g")
+        runner.trigger("g")
+        assert sleep_calls == []
+
+        runner.shutdown(wait=True)
+
+    def test_zero_or_negative_retry_delay_no_sleep(self):
+        """retry_delay_seconds=0 或负数时，即使重试也不调用 sleep"""
+        sleep_calls: List[float] = []
+        runner = InternalTaskRunner(sleep_provider=lambda s: sleep_calls.append(s))
+
+        def fail(**kw):
+            raise RuntimeError
+
+        runner.register(
+            TaskDefinition(
+                task_id="f2",
+                task_type=TaskType.MANUAL,
+                handler=fail,
+                max_retries=3,
+                retry_delay_seconds=0.0,
+            )
+        )
+        runner.activate("f2")
+        runner.trigger("f2")
+        assert sleep_calls == []
+
+        runner.shutdown(wait=True)
+
+
+# =====================================================================
+# resume 追赶补偿测试
+# =====================================================================
+class TestResumeCatchUp:
+    def test_resume_no_catchup_drops_periods(self):
+        """默认 catch_up=False：恢复后 next_run_at = now + interval，跳过暂停期间周期"""
+        clock = FakeClock(0.0)
+        runner = InternalTaskRunner(time_provider=clock.now)
+        handler, counter = make_counter()
+
+        runner.register(
+            TaskDefinition(
+                task_id="p",
+                task_type=TaskType.PERIODIC,
+                handler=handler,
+                interval_seconds=10.0,
+            )
+        )
+        runner.activate("p")
+
+        # 执行一次（t=10）
+        clock.advance(10.0)
+        runner.tick()
+        assert counter == [0]
+
+        # 暂停在 t=10，此时 next_run_at = 20
+        runner.pause("p")
+
+        # 模拟 100 秒过去
+        clock.advance(100.0)  # t=110
+
+        # 默认 resume：next_run_at = now + interval = 120
+        info = runner.resume("p", catch_up=False)
+        assert info.next_run_at == pytest.approx(120.0)
+        assert info.catch_up is False
+
+        # 推进到 t=119，不到 120，不应执行
+        for _ in range(9):
+            clock.advance(1.0)
+            runner.tick()
+        # t=119 时还没到 next_run_at=120，counter 仍为 1
+        assert len(counter) == 1
+        # 再推进 11 秒（到 t=130），其中 t=120 会触发一次
+        executed_in_this_window = 0
+        for _ in range(11):
+            clock.advance(1.0)
+            recs = runner.tick()
+            executed_in_this_window += len(recs)
+        # t=120 执行 1 次，之后到 t=130 还没到下一个 130 的调度（下一个是 130 刚好）
+        assert executed_in_this_window >= 1
+        assert len(counter) >= 2
+
+        runner.shutdown(wait=True)
+
+    def test_resume_catchup_runs_missed_periods(self):
+        """catch_up=True：每次 tick 补跑一个周期，直到追上 now"""
+        clock = FakeClock(0.0)
+        runner = InternalTaskRunner(time_provider=clock.now)
+        handler, counter = make_counter()
+
+        runner.register(
+            TaskDefinition(
+                task_id="q",
+                task_type=TaskType.PERIODIC,
+                handler=handler,
+                interval_seconds=10.0,
+            )
+        )
+        runner.activate("q")
+
+        # t=10 首次执行
+        clock.advance(10.0)
+        runner.tick()
+        assert counter == [0]
+        # next_run_at = 20
+
+        runner.pause("q")
+
+        # 暂停期间过了 105 秒，相当于错过了 t=20,30,...,110 共 10 个周期
+        clock.advance(105.0)  # t=115
+
+        info = runner.resume("q", catch_up=True)
+        assert info.catch_up is True
+        assert info.next_run_at == pytest.approx(20.0)  # 保留原调度
+
+        # 连续 tick（不推进时间）：每个 tick 补跑一次，加上 next_run_at 前进一个 interval
+        # 预期补跑 10 次（20..110）
+        runs_before = len(counter)
+        for _ in range(20):
+            runner.tick()
+        runs_after = len(counter)
+        # 应该补跑了 10 次（20,30,40,50,60,70,80,90,100,110）
+        assert runs_after - runs_before == 10, (
+            f"期望补跑 10 次，实际补跑 {runs_after - runs_before} 次"
+        )
+        # 追平后 catch_up 标志被关闭
+        info = runner.get_task("q")
+        assert info.catch_up is False
+        # 新的 next_run_at 应该是 120（最后补跑 110 后加 interval）
+        assert info.next_run_at == pytest.approx(120.0)
+
+        runner.shutdown(wait=True)
+
+    def test_resume_catchup_eventually_catches_up(self):
+        """追赶过程中，同时 clock 继续推进，最终也能追上"""
+        clock = FakeClock(0.0)
+        runner = InternalTaskRunner(time_provider=clock.now)
+        handler, counter = make_counter()
+
+        runner.register(
+            TaskDefinition(
+                task_id="r",
+                task_type=TaskType.PERIODIC,
+                handler=handler,
+                interval_seconds=10.0,
+            )
+        )
+        runner.activate("r")
+        clock.advance(10.0)
+        runner.tick()  # t=10 run
+        runner.pause("r")
+
+        clock.advance(30.0)  # t=40，错过 20,30 两个周期（下一个应该是 40 即将到达）
+
+        runner.resume("q" if False else "r", catch_up=True)
+        # 先不推进时间，tick 两次：补跑 20、30
+        runner.tick()  # 20
+        runner.tick()  # 30
+        # 再 tick：next_run_at=40，now=40，所以 40 也会跑
+        runner.tick()  # 40
+        assert len(counter) == 4  # 10,20,30,40
+
+        # 追平后下一个是 50
+        info = runner.get_task("r")
+        assert info.next_run_at == pytest.approx(50.0)
+        assert info.catch_up is False
+
+        runner.shutdown(wait=True)
+
+
+# =====================================================================
+# trigger 竞态防护 & handler 动态替换 测试
+# =====================================================================
+class TestRaceAndDynamicHandler:
+    def test_cancel_between_first_and_second_check_produces_skipped(self):
+        """模拟 trigger 校验完成后、_execute_single_run 二次校验前任务被取消，
+        应该得到 SKIPPED 记录，而不是真的执行 handler。
+
+        实现方式：使用线程 + Event，恰好在窗口期内 cancel。"""
+        runner = InternalTaskRunner()
+        ready_e = threading.Event()
+        proceed_e = threading.Event()
+        handler_ran: List[bool] = [False]
+
+        def my_handler(**kw):
+            handler_ran[0] = True
+            return "oops"
+
+        runner.register(
+            TaskDefinition(
+                task_id="m",
+                task_type=TaskType.MANUAL,
+                handler=my_handler,
+            )
+        )
+        runner.activate("m")
+
+        # 保存原始方法
+        orig_execute = InternalTaskRunner._execute_single_run
+
+        def patched_execute(self_ref, info, trigger, extra_kwargs=None):
+            # 在真正进入 _execute_single_run 之前，给测试线程机会去 cancel
+            ready_e.set()
+            proceed_e.wait(timeout=5)
+            return orig_execute(self_ref, info, trigger, extra_kwargs)
+
+        # 使用 monkeypatch 风格替换
+        InternalTaskRunner._execute_single_run = patched_execute
+
+        result_holder: List[TaskRunRecord] = []
+
+        def trigger_thread():
+            result_holder.append(runner.trigger("m"))
+
+        t = threading.Thread(target=trigger_thread)
+        t.start()
+        ready_e.wait(timeout=5)
+        # 现在处于窗口期：trigger 首次校验已过，_execute_single_run 即将开始
+        runner.cancel("m")
+        proceed_e.set()
+        t.join(timeout=5)
+
+        # 恢复
+        InternalTaskRunner._execute_single_run = orig_execute
+
+        assert len(result_holder) == 1
+        record = result_holder[0]
+        # 应该被二次校验拦截为 SKIPPED
+        assert record.is_skipped
+        assert record.status == RunStatus.SKIPPED
+        # handler 不应被调用
+        assert handler_ran[0] is False
+
+        # 历史统计里 skip_count 应该增加
+        info = runner.get_task("m")
+        assert info.skip_count == 1
+
+        runner.shutdown(wait=True)
+
+    def test_unregister_between_checks_produces_skipped_no_error(self):
+        """窗口期注销任务也应安全返回 SKIPPED 记录，不抛异常"""
+        runner = InternalTaskRunner()
+        ready_e = threading.Event()
+        proceed_e = threading.Event()
+
+        runner.register(
+            TaskDefinition(
+                task_id="x",
+                task_type=TaskType.MANUAL,
+                handler=lambda **kw: "x",
+            )
+        )
+        runner.activate("x")
+
+        orig_execute = InternalTaskRunner._execute_single_run
+
+        def patched_execute(self_ref, info, trigger, extra_kwargs=None):
+            ready_e.set()
+            proceed_e.wait(timeout=5)
+            return orig_execute(self_ref, info, trigger, extra_kwargs)
+
+        InternalTaskRunner._execute_single_run = patched_execute
+
+        result_holder: List[Optional[TaskRunRecord]] = [None]
+        exc_holder: List[Optional[Exception]] = [None]
+
+        def trigger_thread():
+            try:
+                result_holder[0] = runner.trigger("x")
+            except Exception as e:
+                exc_holder[0] = e
+
+        t = threading.Thread(target=trigger_thread)
+        t.start()
+        ready_e.wait(timeout=5)
+        # 窗口期注销
+        runner.unregister("x")
+        proceed_e.set()
+        t.join(timeout=5)
+
+        InternalTaskRunner._execute_single_run = orig_execute
+
+        # 不抛异常，返回 SKIPPED
+        assert exc_holder[0] is None
+        assert result_holder[0] is not None
+        assert result_holder[0].is_skipped
+
+        runner.shutdown(wait=True)
+
+    def test_handler_dynamic_replacement_before_run_picks_new_handler(self):
+        """_execute_single_run 入口二次校验时读取 definition_snapshot，
+        在进入前替换 handler 应该生效（新代码路径）"""
+        runner = InternalTaskRunner()
+
+        def old_handler(**kw):
+            return "old"
+
+        def new_handler(**kw):
+            return "new"
+
+        runner.register(
+            TaskDefinition(
+                task_id="dyn",
+                task_type=TaskType.MANUAL,
+                handler=old_handler,
+            )
+        )
+        runner.activate("dyn")
+
+        # 动态替换：直接改 definition.handler
+        info = runner.get_task("dyn")
+        info.definition.handler = new_handler
+
+        r = runner.trigger("dyn")
+        assert r.is_success
+        assert r.result == "new"
+
+        runner.shutdown(wait=True)
+
+    def test_definition_snapshot_prevents_mid_flight_change(self):
+        """definition_snapshot 在二次校验后生成，
+        确保在 handler 执行过程中（如在另一个线程里）替换 handler
+        不会影响本次运行。"""
+        runner = InternalTaskRunner()
+        start_e = threading.Event()
+        wait_e = threading.Event()
+
+        def blocking_handler(**kw):
+            start_e.set()
+            wait_e.wait(timeout=5)
+            return "blocking-result"
+
+        runner.register(
+            TaskDefinition(
+                task_id="mid",
+                task_type=TaskType.MANUAL,
+                handler=blocking_handler,
+            )
+        )
+        runner.activate("mid")
+
+        result_holder: List[Optional[TaskRunRecord]] = [None]
+
+        def trigger_thread():
+            result_holder[0] = runner.trigger("mid")
+
+        t = threading.Thread(target=trigger_thread)
+        t.start()
+        start_e.wait(timeout=5)
+
+        # 运行中尝试替换 handler
+        info = runner.get_task("mid")
+        original_handler = info.definition.handler
+        info.definition.handler = lambda **kw: "injected"
+
+        # 让 handler 结束
+        wait_e.set()
+        t.join(timeout=5)
+
+        # 结果应为 "blocking-result" 而非 "injected"
+        assert result_holder[0] is not None
+        assert result_holder[0].result == "blocking-result"
+
+        # 恢复（保持测试环境整洁）
+        info.definition.handler = original_handler
+
+        runner.shutdown(wait=True)
+
+
+# =====================================================================
+# 新增：确保 reset/cancel_all/activate_all 对 catch_up 字段的正确处理
+# =====================================================================
+class TestCatchUpFlagsReset:
+    def test_activate_clears_catch_up(self):
+        clock = FakeClock(0.0)
+        runner = InternalTaskRunner(time_provider=clock.now)
+        runner.register(
+            TaskDefinition(
+                task_id="p",
+                task_type=TaskType.PERIODIC,
+                handler=MagicMock(),
+                interval_seconds=5.0,
+            )
+        )
+        runner.activate("p")
+        runner.pause("p")
+        runner.resume("p", catch_up=True)
+        assert runner.get_task("p").catch_up is True
+
+        runner.cancel("p")
+        runner.reset("p")
+        # reset 后 catch_up 为 False
+        assert runner.get_task("p").catch_up is False
+
+        # 再 activate 也为 False
+        runner.activate("p")
+        assert runner.get_task("p").catch_up is False
+
+        runner.shutdown(wait=True)

@@ -72,7 +72,7 @@ class ModuleProgress:
         self.error_message = reason
 
     def reset_for_retry(self) -> None:
-        """将状态重置为 PENDING 以支持重试"""
+        """将状态重置为 PENDING 以支持重试（保留 attempts 累计计数）"""
         self.state = ModuleState.PENDING
         self.error_message = ""
         self.init_result = None
@@ -466,7 +466,6 @@ class ModuleInitializer:
 
         node = run.modules[module_id]
         prog.reset_for_retry()
-        prog.attempts = 0
 
         max_retries = node.max_retries + extra_retries
         total_attempts = max_retries + 1
@@ -494,6 +493,13 @@ class ModuleInitializer:
 
         run.completed_at = self._clock()
         run.state = self._determine_final_state(run)
+
+        if last_error is not None and prog.state == ModuleState.FAILED:
+            raise RetryLimitExceededError(
+                f"模块 {module_id!r} 重试次数已达上限（共尝试 {prog.attempts} 次），"
+                f"最后错误: {type(last_error).__name__}: {last_error}"
+            )
+
         return self._make_progress_snapshot(run)
 
     def _retry_affected_downstream(
@@ -570,6 +576,9 @@ class ModuleInitializer:
 
         last_prog = self._make_progress_snapshot(run)
         for mid in sorted_candidates:
-            last_prog = self.retry_module(init_id, mid, context, extra_retries)
+            try:
+                last_prog = self.retry_module(init_id, mid, context, extra_retries)
+            except RetryLimitExceededError:
+                last_prog = self._make_progress_snapshot(run)
 
         return last_prog

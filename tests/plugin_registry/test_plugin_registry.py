@@ -5,6 +5,7 @@ import pytest
 from solocoder_4_py.plugin_registry import (
     PluginAlreadyRegisteredError,
     PluginCapabilityError,
+    PluginDependencyError,
     PluginMetadata,
     PluginNotFoundError,
     PluginRegistry,
@@ -14,6 +15,7 @@ from solocoder_4_py.plugin_registry import (
     PluginStatus,
     PluginVersionError,
 )
+from unittest.mock import patch
 
 
 # =====================================================================
@@ -270,12 +272,17 @@ class TestPluginStateManagement:
         with pytest.raises(PluginNotFoundError):
             registry.set_status("nonexistent", PluginStatus.ENABLED)
 
-    def test_set_status_enabled_twice_increments_count_once(self):
+    def test_set_status_enabled_twice_raises_state_error(self):
         registry = PluginRegistry()
         registry.register(create_test_metadata("plugin1"))
 
         registry.set_status("plugin1", PluginStatus.ENABLED)
-        registry.set_status("plugin1", PluginStatus.ENABLED)
+
+        with pytest.raises(PluginStateError) as exc_info:
+            registry.set_status("plugin1", PluginStatus.ENABLED)
+
+        assert exc_info.value.operation == "enable"
+        assert exc_info.value.current_status == PluginStatus.ENABLED.value
 
         runtime_info = registry.get_plugin("plugin1")
         assert runtime_info.enable_count == 1
@@ -974,3 +981,423 @@ class TestIntegrationScenarios:
                 required_version=">=2.0.0",
                 required_capabilities=["subscription"],
             )
+
+
+# =====================================================================
+# 依赖校验测试
+# =====================================================================
+class TestPluginDependencyValidation:
+    def test_enable_with_dependency_not_registered_raises(self):
+        registry = PluginRegistry()
+        registry.register(
+            create_test_metadata(
+                "plugin_a",
+                dependencies={"plugin_b": ">=1.0.0"},
+            )
+        )
+
+        with pytest.raises(PluginDependencyError) as exc_info:
+            registry.enable("plugin_a")
+
+        assert exc_info.value.plugin_id == "plugin_a"
+        assert exc_info.value.dependency_id == "plugin_b"
+        assert "未注册" in exc_info.value.reason
+
+    def test_enable_with_dependency_not_enabled_raises(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("plugin_b", version="1.2.0"))
+        registry.register(
+            create_test_metadata(
+                "plugin_a",
+                dependencies={"plugin_b": ">=1.0.0"},
+            )
+        )
+
+        with pytest.raises(PluginDependencyError) as exc_info:
+            registry.enable("plugin_a")
+
+        assert exc_info.value.plugin_id == "plugin_a"
+        assert exc_info.value.dependency_id == "plugin_b"
+        assert "未启用" in exc_info.value.reason
+        assert "REGISTERED" in exc_info.value.reason
+
+    def test_enable_with_dependency_disabled_raises(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("plugin_b", version="1.2.0"))
+        registry.register(
+            create_test_metadata(
+                "plugin_a",
+                dependencies={"plugin_b": ">=1.0.0"},
+            )
+        )
+        registry.enable("plugin_b")
+        registry.disable("plugin_b")
+
+        with pytest.raises(PluginDependencyError) as exc_info:
+            registry.enable("plugin_a")
+
+        assert exc_info.value.plugin_id == "plugin_a"
+        assert exc_info.value.dependency_id == "plugin_b"
+        assert "未启用" in exc_info.value.reason
+        assert "DISABLED" in exc_info.value.reason
+
+    def test_enable_with_dependency_version_mismatch_raises(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("plugin_b", version="0.8.0"))
+        registry.register(
+            create_test_metadata(
+                "plugin_a",
+                dependencies={"plugin_b": ">=1.0.0"},
+            )
+        )
+        registry.enable("plugin_b")
+
+        with pytest.raises(PluginDependencyError) as exc_info:
+            registry.enable("plugin_a")
+
+        assert exc_info.value.plugin_id == "plugin_a"
+        assert exc_info.value.dependency_id == "plugin_b"
+        assert "版本不满足要求" in exc_info.value.reason
+        assert "0.8.0" in exc_info.value.reason
+        assert ">=1.0.0" in exc_info.value.reason
+
+    def test_enable_with_satisfied_dependencies_succeeds(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("plugin_b", version="1.5.0"))
+        registry.register(
+            create_test_metadata(
+                "plugin_a",
+                dependencies={"plugin_b": ">=1.0.0,<2.0.0"},
+            )
+        )
+        registry.enable("plugin_b")
+
+        runtime_info = registry.enable("plugin_a")
+        assert runtime_info.status == PluginStatus.ENABLED
+        assert runtime_info.enable_count == 1
+
+    def test_enable_with_multiple_dependencies_all_satisfied(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("dep1", version="2.0.0"))
+        registry.register(create_test_metadata("dep2", version="1.5.0"))
+        registry.register(
+            create_test_metadata(
+                "plugin_a",
+                dependencies={
+                    "dep1": "^2.0.0",
+                    "dep2": "~1.5.0",
+                },
+            )
+        )
+        registry.enable("dep1")
+        registry.enable("dep2")
+
+        runtime_info = registry.enable("plugin_a")
+        assert runtime_info.status == PluginStatus.ENABLED
+
+    def test_enable_with_multiple_dependencies_one_fails(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("dep1", version="2.0.0"))
+        registry.register(create_test_metadata("dep2", version="0.5.0"))
+        registry.register(
+            create_test_metadata(
+                "plugin_a",
+                dependencies={
+                    "dep1": "^2.0.0",
+                    "dep2": ">=1.0.0",
+                },
+            )
+        )
+        registry.enable("dep1")
+        registry.enable("dep2")
+
+        with pytest.raises(PluginDependencyError) as exc_info:
+            registry.enable("plugin_a")
+
+        assert exc_info.value.dependency_id == "dep2"
+
+    def test_enable_no_dependencies_succeeds(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("standalone"))
+
+        runtime_info = registry.enable("standalone")
+        assert runtime_info.status == PluginStatus.ENABLED
+
+    def test_enable_with_empty_dependencies_succeeds(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("standalone", dependencies={}))
+
+        runtime_info = registry.enable("standalone")
+        assert runtime_info.status == PluginStatus.ENABLED
+
+    def test_chain_dependencies_enable_in_correct_order(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("level1"))
+        registry.register(
+            create_test_metadata("level2", dependencies={"level1": ">=1.0.0"})
+        )
+        registry.register(
+            create_test_metadata(
+                "level3",
+                dependencies={"level2": ">=1.0.0"},
+            )
+        )
+
+        with pytest.raises(PluginDependencyError):
+            registry.enable("level3")
+
+        registry.enable("level1")
+        with pytest.raises(PluginDependencyError):
+            registry.enable("level3")
+
+        registry.enable("level2")
+        runtime_info = registry.enable("level3")
+        assert runtime_info.status == PluginStatus.ENABLED
+
+    def test_check_and_enable_triggers_dependency_check(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("plugin_b", version="1.0.0"))
+        registry.register(
+            create_test_metadata(
+                "plugin_a",
+                version="2.0.0",
+                capabilities=["api"],
+                dependencies={"plugin_b": ">=1.0.0"},
+            )
+        )
+
+        with pytest.raises(PluginDependencyError):
+            registry.check_and_enable(
+                "plugin_a",
+                required_version=">=2.0.0",
+                required_capabilities=["api"],
+            )
+
+        registry.enable("plugin_b")
+        runtime_info = registry.check_and_enable(
+            "plugin_a",
+            required_version=">=2.0.0",
+            required_capabilities=["api"],
+        )
+        assert runtime_info.status == PluginStatus.ENABLED
+
+    def test_plugin_dependency_error_attributes(self):
+        error = PluginDependencyError(
+            plugin_id="plugin_a",
+            dependency_id="plugin_b",
+            reason="测试原因",
+        )
+        assert error.plugin_id == "plugin_a"
+        assert error.dependency_id == "plugin_b"
+        assert error.reason == "测试原因"
+        assert "plugin_a" in str(error)
+        assert "plugin_b" in str(error)
+        assert "测试原因" in str(error)
+
+
+# =====================================================================
+# 异常处理契约测试
+# =====================================================================
+class TestExceptionHandlingContract:
+    def test_enable_all_propagates_dependency_error(self):
+        registry = PluginRegistry()
+        registry.register(
+            create_test_metadata(
+                "plugin_a",
+                dependencies={"nonexistent": ">=1.0.0"},
+            )
+        )
+
+        with pytest.raises(PluginDependencyError):
+            registry.enable_all()
+
+    def test_enable_all_propagates_version_error(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("plugin_a", version="0.5.0"))
+
+        with patch.object(
+            PluginRegistry, "enable", side_effect=PluginVersionError("plugin_a", "0.5.0", ">=1.0.0")
+        ):
+            with pytest.raises(PluginVersionError) as exc_info:
+                registry.enable_all()
+            assert exc_info.value.plugin_id == "plugin_a"
+            assert exc_info.value.plugin_version == "0.5.0"
+            assert exc_info.value.required_version == ">=1.0.0"
+
+    def test_enable_all_only_catches_plugin_state_error(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("p1"))
+        registry.register(create_test_metadata("p2"))
+        registry.enable("p1")
+
+        with patch.object(
+            PluginRegistry, "enable", side_effect=MemoryError("系统内存不足")
+        ):
+            with pytest.raises(MemoryError) as exc_info:
+                registry.enable_all()
+            assert "系统内存不足" in str(exc_info.value)
+
+    def test_disable_all_propagates_system_error(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("p1"))
+        registry.enable("p1")
+
+        with patch.object(
+            PluginRegistry, "disable", side_effect=RuntimeError("系统错误")
+        ):
+            with pytest.raises(RuntimeError) as exc_info:
+                registry.disable_all()
+            assert "系统错误" in str(exc_info.value)
+
+    def test_enable_all_still_returns_dict_on_success(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("p1"))
+        registry.register(create_test_metadata("p2"))
+        registry.enable("p1")
+
+        results = registry.enable_all()
+        assert results == {"p1": False, "p2": True}
+        assert registry.is_enabled("p2") is True
+
+    def test_disable_all_still_returns_dict_on_success(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("p1"))
+        registry.register(create_test_metadata("p2"))
+        registry.enable("p1")
+
+        results = registry.disable_all()
+        assert results == {"p1": True, "p2": False}
+        assert registry.get_status("p1") == PluginStatus.DISABLED
+
+
+# =====================================================================
+# set_status 统一入口测试
+# =====================================================================
+class TestSetStatusUnifiedEntry:
+    def test_set_status_enabled_delegates_to_enable(self):
+        registry = PluginRegistry()
+        registry.register(
+            create_test_metadata(
+                "plugin_a",
+                version="1.5.0",
+                dependencies={"plugin_b": ">=1.0.0"},
+            )
+        )
+        registry.register(create_test_metadata("plugin_b", version="1.2.0"))
+
+        with pytest.raises(PluginDependencyError):
+            registry.set_status("plugin_a", PluginStatus.ENABLED)
+
+        registry.enable("plugin_b")
+        runtime_info = registry.set_status("plugin_a", PluginStatus.ENABLED)
+        assert runtime_info.status == PluginStatus.ENABLED
+        assert runtime_info.enable_count == 1
+
+    def test_set_status_enabled_performs_version_check(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("plugin_a", version="1.5.0"))
+
+        with patch.object(
+            PluginRegistry, "enable", wraps=registry.enable
+        ) as mock_enable:
+            registry.set_status("plugin_a", PluginStatus.ENABLED)
+            mock_enable.assert_called_once_with("plugin_a")
+
+    def test_set_status_enabled_on_already_enabled_raises(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("plugin_a"))
+        registry.enable("plugin_a")
+
+        with pytest.raises(PluginStateError) as exc_info:
+            registry.set_status("plugin_a", PluginStatus.ENABLED)
+
+        assert exc_info.value.operation == "enable"
+        assert exc_info.value.current_status == PluginStatus.ENABLED.value
+
+    def test_set_status_disabled_delegates_to_disable(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("plugin_a"))
+        registry.enable("plugin_a")
+
+        with patch.object(
+            PluginRegistry, "disable", wraps=registry.disable
+        ) as mock_disable:
+            registry.set_status("plugin_a", PluginStatus.DISABLED)
+            mock_disable.assert_called_once_with("plugin_a")
+
+    def test_set_status_disabled_on_registered_raises(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("plugin_a"))
+
+        with pytest.raises(PluginStateError) as exc_info:
+            registry.set_status("plugin_a", PluginStatus.DISABLED)
+
+        assert exc_info.value.operation == "disable"
+        assert exc_info.value.current_status == PluginStatus.REGISTERED.value
+
+    def test_set_status_disabled_on_disabled_raises(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("plugin_a"))
+        registry.enable("plugin_a")
+        registry.disable("plugin_a")
+
+        with pytest.raises(PluginStateError) as exc_info:
+            registry.set_status("plugin_a", PluginStatus.DISABLED)
+
+        assert exc_info.value.operation == "disable"
+        assert exc_info.value.current_status == PluginStatus.DISABLED.value
+
+    def test_set_status_registered_does_not_need_validation(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("plugin_a"))
+        registry.enable("plugin_a")
+
+        runtime_info = registry.set_status("plugin_a", PluginStatus.REGISTERED)
+        assert runtime_info.status == PluginStatus.REGISTERED
+
+    def test_set_status_registered_on_registered_succeeds(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("plugin_a"))
+
+        runtime_info = registry.set_status("plugin_a", PluginStatus.REGISTERED)
+        assert runtime_info.status == PluginStatus.REGISTERED
+
+    def test_set_status_unified_side_effects(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("plugin_a"))
+
+        r1 = registry.set_status("plugin_a", PluginStatus.ENABLED)
+        assert r1.enable_count == 1
+        assert r1.enabled_at is not None
+
+        r2 = registry.set_status("plugin_a", PluginStatus.DISABLED)
+        assert r2.disabled_at is not None
+
+        r3 = registry.set_status("plugin_a", PluginStatus.ENABLED)
+        assert r3.enable_count == 2
+
+    def test_set_status_unknown_status_raises(self):
+        registry = PluginRegistry()
+        registry.register(create_test_metadata("plugin_a"))
+
+        with pytest.raises(ValueError, match="未知的插件状态"):
+            registry.set_status("plugin_a", "INVALID_STATUS")
+
+    def test_set_status_enabled_with_required_version(self):
+        registry = PluginRegistry()
+        registry.register(
+            create_test_metadata(
+                "plugin_a",
+                version="1.5.0",
+                dependencies={"plugin_b": ">=1.0.0"},
+            )
+        )
+        registry.register(create_test_metadata("plugin_b", version="1.2.0"))
+        registry.enable("plugin_b")
+
+        with patch.object(
+            PluginRegistry, "enable", wraps=registry.enable
+        ) as mock_enable:
+            registry.set_status("plugin_a", PluginStatus.ENABLED)
+            mock_enable.assert_called_once_with("plugin_a")
+

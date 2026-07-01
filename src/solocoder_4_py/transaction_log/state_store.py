@@ -4,6 +4,8 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
 
+from .log_entry import _MISSING
+
 
 @dataclass
 class StateStore:
@@ -14,7 +16,10 @@ class StateStore:
         return self._data.get(key, default)
 
     def set(self, key: str, value: Any) -> Any:
-        old_value = self._data.get(key)
+        if key in self._data:
+            old_value = self._data[key]
+        else:
+            old_value = _MISSING
         self._data[key] = value
         return old_value
 
@@ -22,7 +27,7 @@ class StateStore:
         if key in self._data:
             old_value = self._data.pop(key)
             return True, old_value
-        return False, None
+        return False, _MISSING
 
     def exists(self, key: str) -> bool:
         return key in self._data

@@ -1,0 +1,8 @@
+产物不满意：
+1. README.md 的 API 参考表格未更新：get_with_level 方法的签名仍为旧版 get_with_level(key)，未体现新增的 loader、tags、ttl 等参数；get_or_load 方法的行也未反映返回类型从 T 变更为 Optional[T] 的改动。触发节点为 README.md 的 API 参考表格区域。业务影响是用户参考文档时会使用错误的函数签名。根本原因是模型在 session-cot-2 中声称"已更新 API 参考表格"，但实际写入时遗漏了该更新。解决方案是逐行对照代码签名更新 API 表格，并回读确认。
+2. loader 调用计数不一致：LayeredCache 使用独立的 _stats_loader_calls 整型变量追踪 loader 调用次数，而非复用 _request_stats.loader_calls 字段（CacheStats 数据类已定义该字段）。触发节点为 layered_cache.py 的 LayeredCache 类。业务影响是 _request_stats.to_dict() 返回的 loader_calls 始终为 0，直接读取 _request_stats 对象会得到错误的统计信息。根本原因是引入 _request_stats 时未充分审查 CacheStats 的字段定义。解决方案是统一使用 _request_stats.loader_calls 进行计数和读取。
+3. TTL 回填耦合：永不过期条目的回填逻辑采用 backfill_shared_no_expiry 标志位配合事后直接修改 local_entry.expires_at=None 的方案，引入了 LayeredCache 对 SingleLevelCache 内部条目对象可变性的隐式依赖。触发节点为 layered_cache.py 的 get 和 get_with_level 方法。业务影响是若 SingleLevelCache 将来改为返回条目副本而非引用，该逻辑将失效。根本原因是 SingleLevelCache.set() 不支持"永不过期"语义，而模型选择绕过接口约束直接修改内部对象。解决方案是从 SingleLevelCache 层面增加显式的永不过期语义支持，或通过重构回填逻辑解耦。
+
+过程不满意：
+1. 模型在 session-cot-2 中经历多轮"改代码→跑测试→再改→再跑"的试错循环（3 个失败→修复→新的失败→再修复），总计 4 次 pytest 运行才全部通过。触发节点为 session-cot-2 中首次 pytest 结果（统计计数预期错误、共享缓存 TTL 默认值导致永不过期场景失败、loader 返回 None 被错误缓存）。实际行为是第一次修复时用显式传入 ttl=None 方式未解决问题，才发现需要直接修改内部条目对象。业务影响降低了修复效率。根本原因是模型编写修复代码时未对 TTL 参数传递的边界行为做充分推演。解决方案是在修改核心逻辑前枚举所有边界条件（如 TTL=None 时 set() 的实际行为）并一次性正确实现。
+2. get 和 get_with_level 中的 TTL 回填逻辑完全重复（约 15 行），未抽取公共方法。触发节点为 layered_cache.py 中两处通过 replace_all=true 同时修改的相同代码段。实际行为是两个公共方法维护了同一段回填逻辑的两个副本，随功能迭代会持续增加维护成本和引入不一致风险。根本原因是模型在扩展 get_with_level 时选择了复制粘贴而非抽象提取。解决方案是抽取 _backfill_from_shared 私有方法使两个公共方法共享同一段回填逻辑。

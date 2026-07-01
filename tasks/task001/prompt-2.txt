@@ -1,0 +1,7 @@
+你实现的事务协调功能模块存在一些问题，需要修复：
+1. execute_transaction 方法中存在对 TimeoutDecisionAbortedError 的显式捕获分支，但 prepare_transaction 方法在任何超时场景下都没有抛出该异常，这个 catch 分支是永远不会被触发的死代码。需要删除这个无效分支，或者让 prepare_transaction 在超时时真正抛出该异常。
+2. execute_transaction 在调用 commit_transaction 后用 `except TransactionStateError: pass` 静默吞掉了提交阶段的异常，当部分参与者提交失败时调用者拿到的是 COMMITTED 状态而不知道存在失败。需要区分「事务已处终态无需操作」和「提交过程中出错」两种场景并分别处理。
+3. 协调器 abort_transaction 遍历参与者执行 abort 回调时，若某参与者回调失败，异常被捕获后追加到 errors 列表但循环继续并最终将事务标为 ABORTED，而参与者端 abort 方法在回调失败后会回退到非终态，协调器和参与者状态不一致。需要为 abort 失败的参与者设计并实现明确的处置策略。
+4. 修复后需要为该模块补充参与者 abort 回调失败场景以及协调器 commit 部分失败场景的单元测试。
+5. 更新 README.md 说明修复后的异常处理契约和参与者 abort 失败时的处理策略。
+6. 重新运行 poetry run pytest tests/transaction_coordination/ -q，需要让所有测试通过。

@@ -10,6 +10,7 @@ from .constants import (
     TransactionState,
 )
 from .exceptions import (
+    CommitFailedError,
     ParticipantAlreadyRegisteredError,
     PrepareFailedError,
     TimeoutDecisionAbortedError,
@@ -30,6 +31,7 @@ class TransactionContext:
     failed_participants: Set[str] = field(default_factory=set)
     committed_participants: Set[str] = field(default_factory=set)
     aborted_participants: Set[str] = field(default_factory=set)
+    abort_failed_participants: Set[str] = field(default_factory=set)
     prepare_started_at: Optional[float] = None
     final_decision_made: bool = False
     decision: Optional[TransactionState] = None
@@ -147,12 +149,16 @@ class TransactionCoordinator:
                 ctx.prepare_started_at = self._clock()
 
         all_prepared = True
+        timed_out = False
         for pid in list(ctx.participants_order):
             with self._lock:
                 ctx = self._transactions[tx_id]
                 if ctx.final_decision_made:
+                    if ctx.decision == TransactionState.TIMEOUT_ABORTED:
+                        timed_out = True
                     break
                 if self._check_prepare_timeout_locked(ctx):
+                    timed_out = True
                     all_prepared = False
                     break
                 participant = ctx.participants[pid]
@@ -170,6 +176,7 @@ class TransactionCoordinator:
                     ctx.failed_participants.add(pid)
                     ctx.errors.append(str(exc))
                     if self._check_prepare_timeout_locked(ctx):
+                        timed_out = True
                         all_prepared = False
                         break
                 all_prepared = False
@@ -185,13 +192,27 @@ class TransactionCoordinator:
 
                 # 每次参与者 prepare 结束后再次检查超时
                 if self._check_prepare_timeout_locked(ctx):
+                    timed_out = True
                     all_prepared = False
                     break
 
         with self._lock:
             ctx = self._transactions[tx_id]
+            if timed_out:
+                raise TimeoutDecisionAbortedError(
+                    f"事务 {tx_id} prepare 阶段超时，已决策中止：{'; '.join(ctx.errors)}"
+                )
             if ctx.final_decision_made:
-                return ctx.decision == TransactionState.COMMITTED
+                if ctx.decision == TransactionState.PREPARED:
+                    return True
+                if ctx.decision in (
+                    TransactionState.ABORTED,
+                    TransactionState.TIMEOUT_ABORTED,
+                ):
+                    return False
+                raise TransactionStateError(
+                    f"事务 {tx_id} 已决策为 {ctx.decision.value}，不能再执行 prepare"
+                )
 
             if all_prepared and len(ctx.prepared_participants) == len(
                 ctx.participants
@@ -258,11 +279,11 @@ class TransactionCoordinator:
         with self._lock:
             ctx = self._transactions[tx_id]
             if errors:
-                # 本实现中一旦 COMMITTING 即视为最终决策为 COMMITTED
+                # 一旦进入 COMMITTING 即视为最终决策为 COMMITTED
                 ctx.final_decision_made = True
                 ctx.decision = TransactionState.COMMITTED
                 ctx.state = TransactionState.COMMITTED
-                raise TransactionStateError(
+                raise CommitFailedError(
                     f"事务 {tx_id} 部分参与者 commit 失败：{'; '.join(errors)}"
                 )
             ctx.final_decision_made = True
@@ -276,6 +297,10 @@ class TransactionCoordinator:
         """执行阶段二：中止事务
 
         幂等：已经 ABORTED/TIMEOUT_ABORTED 的事务直接返回。
+
+        注意：若某参与者 abort 回调失败，该参与者会被标记到 abort_failed_participants，
+        协调器保持 ABORTING 状态。调用者需通过 retry_abort() 重试，直到所有参与者
+        成功 abort（协调器转为 ABORTED）。
         """
         with self._lock:
             ctx = self._require_transaction(tx_id)
@@ -306,26 +331,83 @@ class TransactionCoordinator:
                 ctx.final_decision_made = True
                 ctx.decision = TransactionState.ABORTED
 
-        for pid in list(ctx.participants_order):
+        self._do_abort_participants(tx_id, list(ctx.participants_order))
+
+    def _do_abort_participants(self, tx_id: str, pids_to_abort: List[str]) -> bool:
+        """执行具体的参与者 abort 操作
+
+        :returns: True 表示所有指定参与者均 abort 成功；False 表示存在失败
+        """
+        all_success = True
+        for pid in pids_to_abort:
             with self._lock:
                 ctx = self._transactions[tx_id]
                 participant = ctx.participants[pid]
                 if pid in ctx.aborted_participants:
+                    ctx.abort_failed_participants.discard(pid)
                     continue
             try:
                 participant.abort(tx_id)
                 with self._lock:
                     ctx = self._transactions[tx_id]
                     ctx.aborted_participants.add(pid)
+                    ctx.abort_failed_participants.discard(pid)
             except Exception as exc:
+                all_success = False
                 with self._lock:
                     ctx = self._transactions[tx_id]
-                    ctx.errors.append(str(exc))
+                    ctx.abort_failed_participants.add(pid)
+                    ctx.errors.append(f"参与者 {pid} abort 失败：{exc}")
 
         with self._lock:
             ctx = self._transactions[tx_id]
-            if ctx.state == TransactionState.ABORTING:
-                ctx.state = TransactionState.ABORTED
+            if ctx.state == TransactionState.ABORTING and not ctx.abort_failed_participants:
+                if ctx.decision == TransactionState.TIMEOUT_ABORTED:
+                    ctx.state = TransactionState.TIMEOUT_ABORTED
+                else:
+                    ctx.state = TransactionState.ABORTED
+
+        return all_success
+
+    def retry_abort(self, tx_id: str) -> bool:
+        """重试 abort 那些之前失败的参与者
+
+        :returns: True 表示所有参与者均已成功 abort（事务进入 ABORTED）
+                   False 表示仍有参与者 abort 失败（保持 ABORTING）
+        """
+        with self._lock:
+            ctx = self._require_transaction(tx_id)
+
+            if ctx.state in (
+                TransactionState.ABORTED,
+                TransactionState.TIMEOUT_ABORTED,
+            ):
+                return True
+
+            if ctx.state != TransactionState.ABORTING:
+                raise TransactionStateError(
+                    f"事务 {tx_id} 处于 {ctx.state.value}，不在 ABORTING 阶段，不能 retry_abort"
+                )
+
+            failed_pids = list(ctx.abort_failed_participants)
+            if not failed_pids:
+                if ctx.state == TransactionState.ABORTING:
+                    ctx.state = TransactionState.ABORTED
+                return True
+
+        return self._do_abort_participants(tx_id, failed_pids)
+
+    def has_incomplete_abort(self, tx_id: str) -> bool:
+        """查询是否存在未成功 abort 的参与者"""
+        with self._lock:
+            ctx = self._require_transaction(tx_id)
+            return bool(ctx.abort_failed_participants)
+
+    def get_abort_failed_participants(self, tx_id: str) -> List[str]:
+        """查询 abort 失败、需要重试的参与者 ID 列表"""
+        with self._lock:
+            ctx = self._require_transaction(tx_id)
+            return sorted(ctx.abort_failed_participants)
 
     # ------------------------------------------------------------
     # 一键执行
@@ -334,6 +416,9 @@ class TransactionCoordinator:
         """完整执行 2PC 流程（prepare → commit/abort）
 
         :returns: 最终事务状态
+        :raises TimeoutDecisionAbortedError: prepare 阶段超时，决策中止
+        :raises CommitFailedError: commit 阶段部分参与者提交失败（事务仍标记为 COMMITTED）
+        :raises TransactionStateError: 状态机非法转换等错误
         """
         # 已处于终态的事务直接返回（幂等）
         with self._lock:
@@ -350,10 +435,9 @@ class TransactionCoordinator:
                 return ctx.state if ctx else TransactionState.ABORTED
 
         if prepared:
-            try:
-                self.commit_transaction(tx_id)
-            except TransactionStateError:
-                pass
+            # commit_transaction 内部已处理 COMMITTED 幂等返回，
+            # 若抛出 CommitFailedError 或 TransactionStateError 则由调用者处理
+            self.commit_transaction(tx_id)
         else:
             self.abort_transaction(tx_id)
 

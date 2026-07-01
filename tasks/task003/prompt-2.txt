@@ -1,0 +1,8 @@
+你实现的缓存预热编排功能模块存在一些问题，需要修复：
+1. execute_warmup 循环中存在线程安全问题：跳过分支在锁内修改进度状态，而其他分支在锁外访问缓存放数据，锁的持有范围零散不一致。多线程并发执行多个预热流程时可能出现进度计数器脏读和缓存写入竞态。需要统一锁定策略。
+2. CONTINUE_ANYWAY 失败策略存在语义歧义：虽然策略名称暗示尽力继续执行，但下游任务因 _dependencies_ready 判定上游仍在 fail_set 中而被跳过，实际行为与 SKIP_DEPENDENTS 策略相同。当用户选择 CONTINUE_ANYWAY 时期望有依赖的任务也能执行，需要让该策略覆盖依赖就绪判断。
+3. progress_percentage 属性在 total_tasks 为零时直接返回 100%，导致未注册任何任务的空流程在 NOT_STARTED 状态下也显示完成，与状态机语义矛盾。需要根据 state 来判断：NOT_STARTED 时返回 0.0，已执行结束时返回 100.0。
+4. WarmupTask 中定义了 priority 字段但拓扑排序的 Kahn 算法从未使用该字段控制加载顺序，优先级数据形同虚设。需要让排序算法按 priority 降序处理同优先级任务，确保热点数据被优先预热。
+5. 修复后需要为该模块补充并发预热流程、空流程百分比显示和优先级排序的单元测试。
+6. 更新 README.md 说明修复后的线程安全保证、CONTINUE_ANYWAY 的明确语义和优先级排序行为。
+7. 重新运行 poetry run pytest tests/cache_warmup/ -q，需要让所有测试通过。

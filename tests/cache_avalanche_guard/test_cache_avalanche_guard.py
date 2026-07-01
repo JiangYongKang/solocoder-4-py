@@ -564,6 +564,7 @@ class TestBackgroundRenew:
     def test_background_renew_extends_hot_key_ttl(self):
         guard = CacheAvalancheGuard(
             default_ttl=100,
+            jitter_ratio=0,
             hot_key_threshold=3,
             hot_key_window_seconds=60,
             background_renew_interval_seconds=0.1,
@@ -580,7 +581,7 @@ class TestBackgroundRenew:
             assert entry_before is not None
             expiry_before = entry_before.expires_at
 
-            time.sleep(0.5)
+            time.sleep(4)
 
             entry_after = guard.get_entry("hot_key")
             assert entry_after is not None
@@ -822,3 +823,465 @@ class TestIntegration:
             assert stats.hit_rate > 0.85
         finally:
             guard.stop()
+
+
+# =====================================================================
+# ASYNC 异步重建策略测试
+# =====================================================================
+class TestAsyncRebuildStrategy:
+    def test_async_rebuild_returns_degraded_value_immediately(self):
+        guard = CacheAvalancheGuard(enable_background_renew=False)
+        rebuild_started = threading.Event()
+        can_complete = threading.Event()
+
+        def slow_loader():
+            rebuild_started.set()
+            can_complete.wait()
+            return "loaded_value"
+
+        result = guard.get(
+            "async_key",
+            loader=slow_loader,
+            degraded_value="fallback",
+            rebuild_strategy=RebuildStrategy.ASYNC,
+        )
+        assert result == "fallback"
+        assert rebuild_started.wait(timeout=1)
+
+        entry = guard.get_entry("async_key")
+        assert entry is not None
+        assert entry.state == CacheEntryState.DEGRADED
+        assert entry.degraded_value == "fallback"
+
+        can_complete.set()
+        time.sleep(0.2)
+
+        entry_after = guard.get_entry("async_key")
+        assert entry_after is not None
+        assert entry_after.state == CacheEntryState.VALID
+        assert entry_after.value == "loaded_value"
+
+        result_after = guard.get("async_key")
+        assert result_after == "loaded_value"
+        guard.stop()
+
+    def test_async_rebuild_without_degraded_value_returns_none(self):
+        guard = CacheAvalancheGuard(enable_background_renew=False)
+        rebuild_completed = threading.Event()
+
+        def loader():
+            try:
+                return "loaded"
+            finally:
+                rebuild_completed.set()
+
+        result = guard.get(
+            "async_key2",
+            loader=loader,
+            rebuild_strategy=RebuildStrategy.ASYNC,
+        )
+        assert result is None
+        assert rebuild_completed.wait(timeout=2)
+        time.sleep(0.1)
+
+        result_after = guard.get("async_key2")
+        assert result_after == "loaded"
+        guard.stop()
+
+    def test_async_rebuild_failure_persists_degraded_state(self):
+        guard = CacheAvalancheGuard(enable_background_renew=False)
+        rebuild_completed = threading.Event()
+
+        def bad_loader():
+            try:
+                raise ValueError("rebuild failed")
+            finally:
+                rebuild_completed.set()
+
+        result = guard.get(
+            "async_key3",
+            loader=bad_loader,
+            degraded_value="fallback",
+            rebuild_strategy=RebuildStrategy.ASYNC,
+        )
+        assert result == "fallback"
+        assert rebuild_completed.wait(timeout=2)
+        time.sleep(0.1)
+
+        entry = guard.get_entry("async_key3")
+        assert entry is not None
+        assert entry.state == CacheEntryState.DEGRADED
+        assert entry.degraded_value == "fallback"
+
+        result_after = guard.get("async_key3")
+        assert result_after == "fallback"
+        guard.stop()
+
+    def test_sync_rebuild_still_works(self):
+        guard = CacheAvalancheGuard(enable_background_renew=False)
+        call_count = [0]
+
+        def loader():
+            call_count[0] += 1
+            return "sync_value"
+
+        result = guard.get(
+            "sync_key",
+            loader=loader,
+            rebuild_strategy=RebuildStrategy.SYNC,
+        )
+        assert result == "sync_value"
+        assert call_count[0] == 1
+
+        result2 = guard.get("sync_key")
+        assert result2 == "sync_value"
+        assert call_count[0] == 1
+
+
+# =====================================================================
+# 降级值持久化测试
+# =====================================================================
+class TestDegradedValuePersistence:
+    def test_timeout_persists_degraded_value(self):
+        guard = CacheAvalancheGuard(
+            enable_background_renew=False,
+            rebuild_timeout_seconds=0.1,
+            degraded_ttl_seconds=1,
+        )
+        rebuild_started = threading.Event()
+        can_complete = threading.Event()
+
+        def slow_loader():
+            rebuild_started.set()
+            can_complete.wait()
+            return "loaded"
+
+        results: List[object] = []
+
+        def worker1():
+            try:
+                result = guard.get(
+                    "key",
+                    loader=slow_loader,
+                    degraded_value="fallback",
+                    tags=["persist_test"],
+                )
+                results.append(result)
+            except Exception as e:
+                results.append(e)
+
+        def worker2():
+            time.sleep(0.01)
+            try:
+                result = guard.get(
+                    "key",
+                    loader=slow_loader,
+                    degraded_value="fallback",
+                    tags=["persist_test"],
+                )
+                results.append(result)
+            except Exception as e:
+                results.append(e)
+
+        t1 = threading.Thread(target=worker1)
+        t2 = threading.Thread(target=worker2)
+        t1.start()
+        t2.start()
+        rebuild_started.wait(timeout=1)
+        t1.join(timeout=1)
+        t2.join(timeout=1)
+
+        assert "fallback" in results
+
+        entry = guard.get_entry("key")
+        assert entry is not None
+        assert entry.state == CacheEntryState.DEGRADED
+        assert entry.degraded_value == "fallback"
+
+        result_without_degraded = guard.get("key")
+        assert result_without_degraded == "fallback"
+
+        count = guard.invalidate_by_tag("persist_test")
+        assert count == 1
+
+        can_complete.set()
+
+    def test_degraded_value_persists_without_reloader(self):
+        guard = CacheAvalancheGuard(
+            enable_background_renew=False,
+            degraded_ttl_seconds=2,
+        )
+
+        def bad_loader():
+            raise ValueError("boom")
+
+        result1 = guard.get(
+            "persist_key",
+            loader=bad_loader,
+            degraded_value="fallback",
+        )
+        assert result1 == "fallback"
+
+        result2 = guard.get("persist_key")
+        assert result2 == "fallback"
+
+        result3 = guard.get("persist_key", loader=bad_loader)
+        assert result3 == "fallback"
+
+        entry = guard.get_entry("persist_key")
+        assert entry is not None
+        assert entry.state == CacheEntryState.DEGRADED
+
+    def test_timeout_degraded_value_has_independent_ttl(self):
+        guard = CacheAvalancheGuard(
+            enable_background_renew=False,
+            rebuild_timeout_seconds=0.1,
+            degraded_ttl_seconds=0.4,
+        )
+        can_complete = threading.Event()
+        rebuild_started = threading.Event()
+
+        def slow_loader():
+            rebuild_started.set()
+            can_complete.wait()
+            return "loaded"
+
+        def worker_rebuilder():
+            return guard.get(
+                "ttl_key",
+                loader=slow_loader,
+                degraded_value="fallback",
+            )
+
+        def worker_waiter():
+            time.sleep(0.01)
+            return guard.get(
+                "ttl_key",
+                loader=slow_loader,
+                degraded_value="fallback",
+            )
+
+        t_rebuilder = threading.Thread(target=worker_rebuilder)
+        t_waiter = threading.Thread(target=worker_waiter)
+
+        t_rebuilder.start()
+        rebuild_started.wait(timeout=1)
+        t_waiter.start()
+
+        t_waiter.join(timeout=2)
+        assert t_waiter.is_alive() is False
+
+        entry = guard.get_entry("ttl_key")
+        assert entry is not None
+        assert entry.state == CacheEntryState.DEGRADED
+
+        result = guard.get("ttl_key")
+        assert result == "fallback"
+
+        time.sleep(0.2)
+        result2 = guard.get("ttl_key")
+        assert result2 == "fallback"
+
+        time.sleep(0.3)
+        result3 = guard.get("ttl_key")
+        assert result3 is None
+
+        can_complete.set()
+        t_rebuilder.join(timeout=1)
+
+
+# =====================================================================
+# 自定义 TTL 续期测试
+# =====================================================================
+class TestCustomTTLRenewal:
+    def test_set_preserves_original_ttl(self):
+        guard = CacheAvalancheGuard(
+            default_ttl=300,
+            enable_background_renew=False,
+        )
+        entry = guard.set("short_ttl_key", "value", ttl=60)
+        assert entry.original_ttl == 60
+
+        entry2 = guard.set("default_ttl_key", "value")
+        assert entry2.original_ttl == 300
+
+    def test_rebuild_preserves_original_ttl(self):
+        guard = CacheAvalancheGuard(
+            default_ttl=300,
+            enable_background_renew=False,
+        )
+
+        def loader():
+            return "loaded"
+
+        guard.get("custom_ttl_rebuild", loader=loader, ttl=120)
+        entry = guard.get_entry("custom_ttl_rebuild")
+        assert entry is not None
+        assert entry.original_ttl == 120
+
+    def test_renew_hot_key_uses_entry_ttl(self):
+        guard = CacheAvalancheGuard(
+            default_ttl=300,
+            jitter_ratio=0,
+            hot_key_threshold=3,
+            hot_key_window_seconds=60,
+            enable_background_renew=False,
+        )
+
+        guard.set("short_ttl_hot", "value", ttl=10)
+
+        for _ in range(5):
+            guard.get("short_ttl_hot")
+
+        entry = guard.get_entry("short_ttl_hot")
+        assert entry is not None
+        original_expires_at = entry.expires_at
+        original_ttl = entry.original_ttl
+        assert original_ttl == 10
+
+        time.sleep(9)
+
+        now_before = time.time()
+        guard._renew_hot_key("short_ttl_hot", entry)
+
+        entry_after = guard.get_entry("short_ttl_hot")
+        assert entry_after is not None
+        assert entry_after.expires_at > original_expires_at
+
+        expected_min = now_before + 10 - 1
+        expected_max = now_before + 10 + 1
+        assert expected_min <= entry_after.expires_at <= expected_max
+
+    def test_renew_hot_key_default_ttl_fallback(self):
+        guard = CacheAvalancheGuard(
+            default_ttl=300,
+            hot_key_threshold=3,
+            hot_key_window_seconds=60,
+            enable_background_renew=False,
+        )
+
+        entry = CacheEntry(
+            key="no_original_ttl",
+            value="value",
+            expires_at=time.time() + 10,
+            original_ttl=None,
+        )
+        guard._store["no_original_ttl"] = entry
+
+        for _ in range(5):
+            guard.get("no_original_ttl")
+
+        original_expires_at = entry.expires_at
+        guard._renew_hot_key("no_original_ttl", entry)
+
+        entry_after = guard.get_entry("no_original_ttl")
+        assert entry_after is not None
+        assert entry_after.expires_at > original_expires_at
+
+        expected_min = time.time() + 300 * 0.5
+        expected_max = time.time() + 300 * 1.5
+        assert expected_min <= entry_after.expires_at <= expected_max
+
+
+# =====================================================================
+# 短 TTL 续期阈值测试
+# =====================================================================
+class TestShortTTLRenewalThreshold:
+    def test_short_ttl_entry_triggers_renewal(self):
+        guard = CacheAvalancheGuard(
+            default_ttl=300,
+            hot_key_threshold=3,
+            hot_key_window_seconds=60,
+            enable_background_renew=False,
+        )
+
+        now = time.time()
+        guard._store["short_ttl"] = CacheEntry(
+            key="short_ttl",
+            value="value",
+            state=CacheEntryState.VALID,
+            created_at=now - 5,
+            expires_at=now + 2,
+            original_ttl=10,
+            access_timestamps=[now - 1, now - 0.5, now],
+        )
+
+        hot_keys = guard._find_hot_keys_locked()
+        assert any(k == "short_ttl" for k, _ in hot_keys)
+
+    def test_long_ttl_entry_not_triggered_with_low_remaining(self):
+        guard = CacheAvalancheGuard(
+            default_ttl=300,
+            hot_key_threshold=3,
+            hot_key_window_seconds=60,
+            enable_background_renew=False,
+        )
+
+        now = time.time()
+        guard._store["long_ttl"] = CacheEntry(
+            key="long_ttl",
+            value="value",
+            state=CacheEntryState.VALID,
+            created_at=now - 5,
+            expires_at=now + 200,
+            original_ttl=300,
+            access_timestamps=[now - 1, now - 0.5, now],
+        )
+
+        hot_keys = guard._find_hot_keys_locked()
+        assert not any(k == "long_ttl" for k, _ in hot_keys)
+
+    def test_short_ttl_with_high_remaining_not_triggered(self):
+        guard = CacheAvalancheGuard(
+            default_ttl=300,
+            hot_key_threshold=3,
+            hot_key_window_seconds=60,
+            enable_background_renew=False,
+        )
+
+        now = time.time()
+        guard._store["short_ttl_high_remaining"] = CacheEntry(
+            key="short_ttl_high_remaining",
+            value="value",
+            state=CacheEntryState.VALID,
+            created_at=now - 1,
+            expires_at=now + 9,
+            original_ttl=10,
+            access_timestamps=[now - 0.5, now - 0.25, now],
+        )
+
+        hot_keys = guard._find_hot_keys_locked()
+        assert not any(k == "short_ttl_high_remaining" for k, _ in hot_keys)
+
+    def test_find_hot_keys_uses_entry_ttl_not_default(self):
+        guard = CacheAvalancheGuard(
+            default_ttl=300,
+            hot_key_threshold=2,
+            hot_key_window_seconds=60,
+            enable_background_renew=False,
+        )
+
+        now = time.time()
+        guard._store["short"] = CacheEntry(
+            key="short",
+            value="v",
+            state=CacheEntryState.VALID,
+            expires_at=now + 2,
+            original_ttl=10,
+            access_timestamps=[now, now - 0.1],
+        )
+        guard._store["long"] = CacheEntry(
+            key="long",
+            value="v",
+            state=CacheEntryState.VALID,
+            expires_at=now + 200,
+            original_ttl=300,
+            access_timestamps=[now, now - 0.1],
+        )
+
+        hot_keys = guard._find_hot_keys_locked()
+        hot_key_names = [k for k, _ in hot_keys]
+
+        assert "short" in hot_key_names
+        assert "long" not in hot_key_names
+

@@ -1,0 +1,7 @@
+产物不满意：
+1. 自循环依赖检测修复正确：detect_cycles 方法新增了 DFS 之前的自指边专项扫描，将自环以单元素列表形式加入结果。触发节点为 topology.py 第 92-94 行。业务影响已消除——sort 方法抛 CircularDependencyError 时 cycles 字段不再为空。根本原因已正确修复。
+2. RetryLimitExceededError 现在在重试耗尽时真正抛出：retry_module 方法在重试循环结束且 last_error is not None 且状态为 FAILED 时抛出异常，异常消息包含模块 ID、累计尝试次数和最后错误信息。触发节点为 initializer.py 第 497-501 行。同时 retry_all_failed 捕获该异常，确保批量重试时单个模块失败不中断剩余流程。修复正确。
+3. attempts 跨重试周期累计已实现：reset_for_retry 不再重置 attempts，retry_module 中删除了 prog.attempts=0 的显式置零。触发节点为 initializer.py 的 reset_for_retry 方法（第 74-81 行）和 retry_module 方法。修复正确。
+4. 测试补充完善：测试总数从 80 增至 87，新增自环检测 5 个用例、重试异常 2 个用例、attempts 累计 3 个用例。README.md 更新全面覆盖所有变更章节。修复正确。
+
+过程不满意：无。本轮修复过程完整，模型按计划逐步执行：先修复拓扑检测，再处理异常抛出，然后修正 attempts 计数，最后补充测试和文档。测试一次性通过，无试错循环。

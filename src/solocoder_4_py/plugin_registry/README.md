@@ -6,12 +6,15 @@
 
 - **插件元数据管理**：支持声明插件的基本信息、版本、能力、依赖和标签
 - **语义化版本支持**：完整的语义化版本（SemVer）解析、比较和兼容性校验
-- **版本要求表达式**：支持 `>=`、`<=`、`~`、`^` 等多种版本约束语法
+- **版本要求表达式**：支持 `>=`、`<=`、`~`、`^` 等多种版本约束语法，以及逗号分隔的多约束组合
+- **依赖校验**：启用插件前自动校验所有依赖插件已注册、已启用且版本满足要求
 - **插件生命周期管理**：支持注册、注销、启用、停用等状态切换
+- **统一状态入口**：`set_status()` 作为状态转变的统一入口，委托给 `enable()`/`disable()` 确保校验一致
 - **按能力发现**：支持按单个能力、多个能力（全部匹配/任意匹配）发现插件
 - **按标签筛选**：支持按标签组合筛选插件
 - **状态查询**：支持查询插件运行状态、启用次数、时间戳等信息
 - **版本校验启用**：支持在启用插件前自动校验版本和能力要求
+- **精确异常契约**：批量操作仅捕获业务预期内的 `PluginStateError`，系统级异常直接传播
 - **索引加速**：能力和标签自动建索引，查询效率高
 - **线程安全**：所有操作均使用 `threading.RLock` 保护，支持多线程并发
 - **统计信息**：提供插件总数、各状态数量、能力总数等统计数据
@@ -97,6 +100,112 @@ MAJOR.MINOR.PATCH[-PRE_RELEASE][+BUILD_METADATA]
 REGISTERED → ENABLED → DISABLED → ENABLED → ...
      ↓           ↓           ↓
   (注销)      (注销)      (注销)
+```
+
+## 依赖校验机制
+
+插件启用时会自动执行依赖校验，确保插件的所有依赖都满足要求。校验顺序和规则如下：
+
+### 校验顺序
+1. **插件自身版本校验**：如果指定了 `required_version`，先校验插件自身版本
+2. **依赖存在性校验**：检查每个依赖插件是否已注册
+3. **依赖状态校验**：检查每个依赖插件是否已启用（状态为 `ENABLED`）
+4. **依赖版本校验**：检查每个依赖插件的版本是否满足版本要求
+
+### 校验失败场景
+- **依赖未注册**：抛出 `PluginDependencyError`，reason 为 "依赖插件未注册"
+- **依赖未启用**：抛出 `PluginDependencyError`，reason 包含当前状态，如 "依赖插件未启用（当前状态: REGISTERED）"
+- **依赖版本不匹配**：抛出 `PluginDependencyError`，reason 包含当前版本和要求版本
+
+### 依赖声明示例
+```python
+metadata = PluginMetadata(
+    plugin_id="my_plugin",
+    name="我的插件",
+    version="1.0.0",
+    dependencies={
+        "core_framework": ">=2.0.0,<3.0.0",  # 核心框架，要求 2.x 版本
+        "auth_service": "^1.5.0",            # 认证服务，兼容 1.5.x
+        "cache_plugin": "~1.2.0",            # 缓存插件，兼容 1.2.x
+    },
+)
+```
+
+### 启用顺序注意事项
+插件必须按依赖顺序启用。例如，如果插件 A 依赖插件 B，必须先启用 B 再启用 A：
+
+```python
+# 正确顺序
+registry.enable("plugin_b")  # 先启用被依赖的插件
+registry.enable("plugin_a")  # 再启用依赖插件
+
+# 错误顺序 - 会抛出 PluginDependencyError
+registry.enable("plugin_a")  # plugin_b 未启用，校验失败
+```
+
+## 状态转变统一入口
+
+`set_status()` 方法是所有状态转变的统一入口，确保所有状态变更共享相同的校验逻辑和副作用。
+
+### 统一入口设计原则
+1. **单一执行路径**：所有状态转变都通过 `set_status()` 委托给对应的专用方法
+2. **校验一致性**：无论通过 `enable()` 还是 `set_status(ENABLED)`，执行的校验完全相同
+3. **副作用一致**：`enable_count` 计数、`enabled_at` 时间戳等副作用在所有路径下行为一致
+
+### 委托关系
+| 目标状态 | 委托方法 | 执行的校验 |
+|----------|----------|------------|
+| `ENABLED` | `enable(plugin_id)` | 版本校验 + 依赖校验 + 状态检查 |
+| `DISABLED` | `disable(plugin_id)` | 状态检查 |
+| `REGISTERED` | 直接设置 | 无额外校验 |
+
+### 示例对比
+以下两种方式完全等价：
+
+```python
+# 方式一：直接调用专用方法
+runtime_info = registry.enable("my_plugin", required_version=">=1.0.0")
+
+# 方式二：通过统一入口
+runtime_info = registry.set_status("my_plugin", PluginStatus.ENABLED)
+```
+
+> **注意**：`set_status()` 调用 `enable()` 时不传递 `required_version` 参数。如果需要额外的版本约束，请直接调用 `enable(plugin_id, required_version="...")`。
+
+## 异常处理契约
+
+批量操作方法 `enable_all()` 和 `disable_all()` 遵循精确的异常处理契约，确保系统级故障能够被及时发现。
+
+### 异常捕获范围
+- **仅捕获**：`PluginStateError`（业务预期内的状态错误，如重复启用、重复停用）
+- **直接传播**：所有其他异常，包括但不限于：
+  - `PluginDependencyError` - 依赖不满足
+  - `PluginVersionError` - 版本不兼容
+  - `PluginNotFoundError` - 插件不存在（理论上不会发生）
+  - `MemoryError`、`RuntimeError` 等系统级异常
+
+### 设计意图
+这种设计确保了：
+1. **业务失败可预期**：重复启用/停用等常规业务错误被捕获并记录为 `False`
+2. **系统故障可感知**：内存错误、配置错误等严重问题不会被静默吞没
+3. **调试效率高**：异常栈指向真正的故障源头，而不是被包装成简单的 `False`
+
+### 调用方处理建议
+```python
+try:
+    results = registry.enable_all()
+    for plugin_id, success in results.items():
+        if not success:
+            print(f"插件 {plugin_id} 已经是启用状态，跳过")
+except PluginDependencyError as e:
+    print(f"依赖不满足: {e.plugin_id} 需要 {e.dependency_id}，原因: {e.reason}")
+    # 处理依赖问题，如按正确顺序重新启用
+except PluginVersionError as e:
+    print(f"版本不兼容: {e.plugin_id} 当前版本 {e.plugin_version}，要求 {e.required_version}")
+    # 处理版本问题
+except Exception as e:
+    print(f"系统异常: {e}")
+    # 告警或降级处理
 ```
 
 ## 能力发现
@@ -275,6 +384,160 @@ except PluginNotFoundError as e:
     print(f"插件不存在: {e}")
 ```
 
+### 依赖校验示例
+
+```python
+from solocoder_4_py.plugin_registry import (
+    PluginDependencyError,
+)
+
+# 注册三个插件，形成依赖链：report_exporter → data_processor → core_framework
+registry.register(PluginMetadata(
+    plugin_id="core_framework",
+    name="核心框架",
+    version="2.1.0",
+))
+
+registry.register(PluginMetadata(
+    plugin_id="data_processor",
+    name="数据处理器",
+    version="1.5.0",
+    dependencies={
+        "core_framework": ">=2.0.0,<3.0.0",
+    },
+))
+
+registry.register(PluginMetadata(
+    plugin_id="report_exporter",
+    name="报表导出器",
+    version="1.0.0",
+    dependencies={
+        "data_processor": "^1.5.0",
+        "core_framework": ">=2.0.0",
+    },
+))
+
+# 错误的启用顺序 - 直接启用 report_exporter 会失败
+try:
+    registry.enable("report_exporter")
+except PluginDependencyError as e:
+    print(f"启用失败: {e.reason}")  # 依赖插件未启用
+
+# 正确的启用顺序 - 从被依赖的插件开始
+registry.enable("core_framework")
+registry.enable("data_processor")
+registry.enable("report_exporter")
+
+# 检查启用结果
+assert registry.is_enabled("core_framework")
+assert registry.is_enabled("data_processor")
+assert registry.is_enabled("report_exporter")
+
+# 版本不匹配的情况
+registry.register(PluginMetadata(
+    plugin_id="old_plugin",
+    name="旧版本插件",
+    version="0.8.0",
+    dependencies={
+        "core_framework": ">=3.0.0",  # 要求 3.0+，但实际是 2.1.0
+    },
+))
+registry.enable("old_plugin")  # 会抛出 PluginDependencyError，版本不满足
+```
+
+### 状态统一入口示例
+
+```python
+# 注册插件
+registry.register(PluginMetadata(
+    plugin_id="my_service",
+    name="我的服务",
+    version="1.0.0",
+    dependencies={"core_framework": ">=2.0.0"},
+))
+
+# set_status 作为统一入口，与直接调用 enable/disable 行为完全一致
+
+# 启用插件 - set_status 会委托给 enable()，执行完整的依赖校验
+try:
+    registry.set_status("my_service", PluginStatus.ENABLED)
+except PluginDependencyError:
+    # 依赖不满足，先启用依赖
+    registry.register(PluginMetadata(
+        plugin_id="core_framework",
+        name="核心框架",
+        version="2.1.0",
+    ))
+    registry.enable("core_framework")
+    # 现在可以成功启用
+    runtime_info = registry.set_status("my_service", PluginStatus.ENABLED)
+    assert runtime_info.status == PluginStatus.ENABLED
+    assert runtime_info.enable_count == 1
+
+# 重复启用 - 两种方式都会抛出相同的异常
+try:
+    registry.set_status("my_service", PluginStatus.ENABLED)
+except PluginStateError:
+    print("插件已启用")
+
+# 停用插件 - set_status 会委托给 disable()
+registry.set_status("my_service", PluginStatus.DISABLED)
+assert registry.get_status("my_service") == PluginStatus.DISABLED
+
+# 重置为已注册状态
+registry.set_status("my_service", PluginStatus.REGISTERED)
+assert registry.get_status("my_service") == PluginStatus.REGISTERED
+
+# 再次启用 - 计数会递增
+runtime_info = registry.set_status("my_service", PluginStatus.ENABLED)
+assert runtime_info.enable_count == 2
+```
+
+### 批量操作异常处理示例
+
+```python
+# 注册带依赖的插件
+registry.register(PluginMetadata(
+    plugin_id="core",
+    name="核心模块",
+    version="1.0.0",
+))
+registry.register(PluginMetadata(
+    plugin_id="feature_a",
+    name="功能A",
+    version="1.0.0",
+    dependencies={"core": ">=1.0.0"},
+))
+registry.register(PluginMetadata(
+    plugin_id="feature_b",
+    name="功能B",
+    version="1.0.0",
+    dependencies={"nonexistent": ">=1.0.0"},  # 依赖不存在的插件
+))
+
+# 先启用 core，这样 feature_a 的依赖是满足的
+registry.enable("core")
+
+# 调用 enable_all - 会在 feature_b 处抛出 PluginDependencyError
+# feature_a 可能已经被成功启用，但 feature_b 的错误会中断整个过程
+try:
+    results = registry.enable_all()
+except PluginDependencyError as e:
+    print(f"批量启用失败: 插件 {e.plugin_id} 的依赖 {e.dependency_id} 不满足")
+    print(f"失败原因: {e.reason}")
+    # 此时 core 是 ENABLED，feature_a 可能是 ENABLED，feature_b 是 REGISTERED
+    # 调用方可以根据需要进行回滚或修复
+
+# 正确的做法：逐个处理依赖，或确保所有依赖在调用 enable_all 前已就绪
+registry.unregister("feature_b")  # 移除有问题的插件
+
+# 现在可以安全地调用 enable_all
+results = registry.enable_all()
+for plugin_id, success in results.items():
+    status = "成功" if success else "已启用"
+    print(f"插件 {plugin_id}: {status}")
+```
+
 ### 获取统计信息
 
 ```python
@@ -363,9 +626,9 @@ except PluginVersionError as e:
 | `register(metadata)` | 注册插件 |
 | `unregister(plugin_id)` | 注销插件 |
 | `update_metadata(plugin_id, metadata)` | 更新插件元数据 |
-| `enable(plugin_id, required_version=None)` | 启用插件 |
+| `enable(plugin_id, required_version=None)` | 启用插件（自动校验版本和依赖） |
 | `disable(plugin_id)` | 停用插件 |
-| `set_status(plugin_id, status)` | 设置插件状态 |
+| `set_status(plugin_id, status)` | 设置插件状态（统一入口，委托给 enable/disable） |
 | `get_status(plugin_id)` | 获取插件状态 |
 | `is_enabled(plugin_id)` | 检查插件是否已启用 |
 | `get_plugin(plugin_id)` | 获取插件运行时信息 |
@@ -377,13 +640,14 @@ except PluginVersionError as e:
 | `find_by_tag(tag, enabled_only)` | 按标签查找 |
 | `find_by_tags(tags, match_all, enabled_only)` | 按多标签查找 |
 | `check_plugin_version(plugin_id, required_version)` | 检查版本兼容性 |
-| `check_and_enable(plugin_id, required_version, required_capabilities)` | 检查后启用 |
+| `check_and_enable(plugin_id, required_version, required_capabilities)` | 检查后启用（校验版本、能力、依赖） |
 | `get_stats()` | 获取统计信息 |
 | `get_all_capabilities()` | 获取所有能力列表 |
 | `get_all_tags()` | 获取所有标签列表 |
-| `enable_all()` | 批量启用所有插件 |
-| `disable_all()` | 批量停用所有插件 |
+| `enable_all()` | 批量启用所有插件（仅捕获 PluginStateError） |
+| `disable_all()` | 批量停用所有插件（仅捕获 PluginStateError） |
 | `clear()` | 清空所有插件 |
+| `_validate_dependencies(plugin_id, dependencies)` | 校验插件依赖（内部方法） |
 
 ### PluginMetadata 主要方法
 
@@ -408,4 +672,5 @@ except PluginVersionError as e:
 | `PluginAlreadyRegisteredError` | 插件已注册 |
 | `PluginVersionError` | 版本不兼容 |
 | `PluginCapabilityError` | 缺少所需能力 |
-| `PluginStateError` | 状态操作非法 |
+| `PluginDependencyError` | 依赖不满足（未注册/未启用/版本不匹配） |
+| `PluginStateError` | 状态操作非法（批量操作中唯一会被捕获的异常） |

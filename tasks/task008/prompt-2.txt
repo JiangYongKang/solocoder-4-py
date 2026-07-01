@@ -1,0 +1,7 @@
+你实现的插件注册中心功能模块存在一些问题，需要修复：
+1. PluginMetadata 数据类定义了 dependencies 字典字段用于声明插件之间的依赖关系，但 PluginRegistry 在所有生命周期操作（enable、disable 等）中完全不检查依赖插件是否存在、是否已启用或版本是否匹配。需要在 enable 方法中增加依赖校验逻辑，验证每个依赖插件已注册且已启用、版本满足兼容要求。
+2. enable_all 和 disable_all 两个批量操作方法使用裸 Exception 捕获吞没了所有异常，包括内存错误等系统级错误也被转为 False。当出现非预期的系统级异常时，调用方无法区分业务失败与系统故障。应将异常捕获范围收窄为仅捕获 PluginStateError。
+3. set_status 方法可以直接将插件状态设为 ENABLED 而不执行版本兼容性校验，且对已启用的插件再次设为 ENABLED 时不会像 enable 方法那样抛出 PluginStateError。两条不同路径通向同一目标状态但前置校验和副作用不同，版本约束可能被绕过。set_status 在转向 ENABLED 时应委托 enable 方法，转向 DISABLED 时应委托 disable 方法，确保所有状态转变共享同一执行路径。
+4. 修复后需要为该模块补充依赖校验失败、系统异常传播和 set_status 绕过版本校验的单元测试。
+5. 更新 README.md 说明修复后的依赖校验逻辑、异常处理契约和状态转变的统一入口。
+6. 重新运行 poetry run pytest tests/plugin_registry/ -q，需要让所有测试通过。

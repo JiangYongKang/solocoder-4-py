@@ -68,12 +68,13 @@ layered_cache/
    - 未命中 → 继续
 
 2. **查询 L2 共享缓存**
-   - 命中 → 将值回填到 L1（继承标签和 TTL），然后返回
+   - 命中 → 将值回填到 L1（继承标签，**使用共享条目的剩余存活时间作为回填 TTL**），然后返回
    - 未命中 → 继续
 
 3. **调用数据源 loader 函数**
    - 成功 → 将值同时写入 L2 和 L1（带标签、TTL），然后返回
    - 失败 → 抛出 `CacheLoaderError`（不污染缓存）
+   - 返回 None → 不缓存，直接返回 None
 
 ```python
 def get(key, loader=None, tags=None, ttl=None):

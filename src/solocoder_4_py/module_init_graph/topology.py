@@ -88,6 +88,11 @@ class TopologyAnalyzer:
                 adj[dep].append(module_id)
 
         cycles: List[List[str]] = []
+
+        for module_id, node in modules.items():
+            if module_id in node.dependencies:
+                cycles.append([module_id])
+
         all_nodes = sorted(modules.keys())
 
         for start_idx in range(len(all_nodes)):

@@ -2,6 +2,7 @@ from .constants import DEFAULT_PLUGIN_VERSION, MINIMUM_SUPPORTED_VERSION, Plugin
 from .exceptions import (
     PluginAlreadyRegisteredError,
     PluginCapabilityError,
+    PluginDependencyError,
     PluginNotFoundError,
     PluginRegistryError,
     PluginStateError,
@@ -23,5 +24,6 @@ __all__ = [
     "PluginAlreadyRegisteredError",
     "PluginVersionError",
     "PluginCapabilityError",
+    "PluginDependencyError",
     "PluginStateError",
 ]

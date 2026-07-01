@@ -1,0 +1,9 @@
+你实现的内部任务运行器功能模块存在一些问题，需要修复：
+1. TaskDefinition 中定义了 timeout_seconds 和 retry_delay_seconds 两个字段，但 _execute_single_run 方法在执行 handler 时既没有超时中断机制也没有在重试之间插入延迟。handler 卡死会阻塞整个 tick 调度，重试风暴可能瞬间耗尽所有次数。需要实现超时中断和重试延迟。
+2. resume 方法对周期任务直接将 next_run_at 设为 now + interval_seconds，丢弃了暂停期间所有应执行的周期。长时间暂停后数据同步或结算任务会出现遗漏。需要支持可选的追赶补偿机制，恢复后逐周期执行直到追平当前时间。
+3. _execute_single_run 方法中锁内已完成 last_error 的赋值，但锁外又进行了一次相同的无锁写入，属于冗余且有线程安全隐患。需要删除锁外的重复赋值。
+4. trigger 方法先持锁验证状态后释放锁再执行 handler，状态检查与 handler 执行之间存在竞态窗口。任务在该窗口期被 cancel 后仍可能产生运行记录。需要将状态验证与 handler 执行封装在同一个锁保护范围内。
+5. register 方法中存在重复校验：检查 is_periodic 且无 interval 时抛 InvalidScheduleError，但 TaskDefinition 构造器已对同样条件抛出 ValueError，此分支永远不可达。需要删除 register 中的冗余校验。
+6. 修复后需要为该模块补充 handler 超时场景、resume 追赶补偿、trigger 竞态防护和 handler 动态替换的单元测试。
+7. 更新 README.md 说明修复后的超时机制、重试延迟、周期追赶策略和触发器竞态防护。
+8. 重新运行 poetry run pytest tests/internal_task_runner/ -q，需要让所有测试通过。

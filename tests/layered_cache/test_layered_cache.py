@@ -401,8 +401,12 @@ class TestLayeredCache:
 
         local_stats = cache.get_stats()["local"]
         shared_stats = cache.get_stats()["shared"]
+        overall_stats = cache.get_stats()["overall"]
         assert local_stats["hits"] == 1
         assert shared_stats["accesses"] == 0
+        assert overall_stats["accesses"] == 1
+        assert overall_stats["hits"] == 1
+        assert overall_stats["hit_rate"] == 1.0
 
     def test_shared_hit_backfills_local(self):
         cache = LayeredCache()
@@ -637,10 +641,25 @@ class TestLayeredCache:
         stats = cache.get_stats()
         overall = stats["overall"]
 
-        assert overall["accesses"] > 0
-        assert overall["hits"] >= 3
+        assert overall["accesses"] == 4  # 4 次 get 调用（set 不计入 overall）
+        assert overall["hits"] == 3  # a, b, missing(第二次命中)
+        assert overall["misses"] == 1  # 第一次 missing
         assert overall["loader_calls"] == 1
-        assert 0 <= overall["hit_rate"] <= 1.0
+        assert overall["hit_rate"] == 3 / 4
+
+    def test_request_level_stats_not_double_counted(self):
+        """验证一次 get 调用不会因为访问多层缓存而被重复计数"""
+        cache = LayeredCache()
+        cache.set_shared("shared_only", "value", tags=["t"])
+
+        cache.get("shared_only")
+
+        stats = cache.get_stats()
+        overall = stats["overall"]
+        assert overall["accesses"] == 1  # 只计 1 次
+        assert overall["hits"] == 1     # 计 1 次命中
+        assert overall["misses"] == 0
+        assert overall["hit_rate"] == 1.0
 
     def test_loader_calls_counter(self):
         cache = LayeredCache()
@@ -829,3 +848,226 @@ class TestLayeredCache:
 
         stats = app_cache.get_stats()
         assert stats["overall"]["loader_calls"] == 4
+
+    # ------------------------------------------------------------
+    # 新增：共享缓存 TTL 回填一致性测试
+    # ------------------------------------------------------------
+    def test_shared_hit_backfills_with_remaining_ttl(self):
+        """共享缓存命中回填本地时，使用共享条目的剩余存活时间"""
+        cache = LayeredCache(local_ttl=300, shared_ttl=300)
+
+        cache.set_shared("k", "v", ttl=100)
+
+        shared_entry_before = cache.get_entry_shared("k")
+        assert shared_entry_before is not None
+        shared_ttl_before = shared_entry_before.remaining_ttl()
+        assert shared_ttl_before is not None
+        assert 99 <= shared_ttl_before <= 101
+
+        time.sleep(0.1)
+
+        cache.get("k")
+
+        local_entry = cache.get_entry_local("k")
+        assert local_entry is not None
+        local_ttl = local_entry.remaining_ttl()
+        assert local_ttl is not None
+
+        shared_entry_after = cache.get_entry_shared("k")
+        assert shared_entry_after is not None
+        shared_ttl_after = shared_entry_after.remaining_ttl()
+        assert shared_ttl_after is not None
+
+        assert abs(local_ttl - shared_ttl_after) < 0.5
+
+    def test_shared_hit_ttl_explicit_local_ttl_takes_precedence(self):
+        """显式传入 local_ttl 时，优先使用传入的 TTL 而非共享条目的剩余 TTL"""
+        cache = LayeredCache()
+
+        cache.set_shared("k", "v", ttl=100)
+
+        cache.get("k", local_ttl=10)
+
+        local_entry = cache.get_entry_local("k")
+        assert local_entry is not None
+        local_ttl = local_entry.remaining_ttl()
+        assert local_ttl is not None
+        assert 9 <= local_ttl <= 11
+
+    def test_shared_hit_ttl_unified_ttl_takes_precedence(self):
+        """显式传入 ttl 参数时，优先使用统一 TTL 而非共享条目的剩余 TTL"""
+        cache = LayeredCache()
+
+        cache.set_shared("k", "v", ttl=100)
+
+        cache.get("k", ttl=20)
+
+        local_entry = cache.get_entry_local("k")
+        assert local_entry is not None
+        local_ttl = local_entry.remaining_ttl()
+        assert local_ttl is not None
+        assert 19 <= local_ttl <= 21
+
+    def test_shared_hit_no_ttl_when_shared_has_no_expiry(self):
+        """当共享条目永不过期时，回填的本地条目也永不过期（除非显式指定 TTL）"""
+        shared_cache = SingleLevelCache(max_size=1000, default_ttl=None)
+        cache = LayeredCache(
+            local_ttl=300,
+            shared_cache_instance=shared_cache,
+        )
+
+        cache.set_shared("k", "v")
+
+        shared_entry = cache.get_entry_shared("k")
+        assert shared_entry is not None
+        assert shared_entry.expires_at is None
+
+        cache.get("k")
+
+        local_entry = cache.get_entry_local("k")
+        assert local_entry is not None
+        assert local_entry.expires_at is None
+
+    # ------------------------------------------------------------
+    # 新增：get_or_load 返回 None 场景测试
+    # ------------------------------------------------------------
+    def test_get_or_load_returns_none_when_loader_returns_none(self):
+        """get_or_load 当 loader 返回 None 时正确返回 None"""
+        cache = LayeredCache()
+        result = cache.get_or_load("nonexistent", lambda: None)
+        assert result is None
+
+    def test_get_or_load_none_does_not_cache(self):
+        """loader 返回 None 时不会缓存 None（当前行为）"""
+        cache = LayeredCache()
+        call_count = [0]
+
+        def loader():
+            call_count[0] += 1
+            return None
+
+        result1 = cache.get_or_load("k", loader)
+        result2 = cache.get_or_load("k", loader)
+
+        assert result1 is None
+        assert result2 is None
+        assert call_count[0] == 2
+
+    def test_get_or_load_optional_type_annotation(self):
+        """验证 get_or_load 的返回类型为 Optional[T]"""
+        from typing import get_type_hints
+        hints = get_type_hints(LayeredCache.get_or_load)
+        return_annotation = hints.get("return")
+        assert return_annotation is not None
+        assert "Optional" in str(return_annotation)
+
+    # ------------------------------------------------------------
+    # 新增：get_with_level loader 支持测试
+    # ------------------------------------------------------------
+    def test_get_with_level_with_loader_from_source(self):
+        """get_with_level 支持 loader，从数据源加载时返回 SOURCE 层级"""
+        cache = LayeredCache()
+        call_count = [0]
+
+        def loader():
+            call_count[0] += 1
+            return "loaded"
+
+        value, level = cache.get_with_level("k", loader=loader, tags=["t"])
+        assert value == "loaded"
+        assert level == CacheLevel.SOURCE
+        assert call_count[0] == 1
+
+        assert cache.get_local("k") == "loaded"
+        assert cache.get_shared("k") == "loaded"
+
+        value2, level2 = cache.get_with_level("k", loader=loader)
+        assert value2 == "loaded"
+        assert level2 == CacheLevel.LOCAL
+        assert call_count[0] == 1
+
+    def test_get_with_level_with_ttl_params(self):
+        """get_with_level 支持 ttl、local_ttl、shared_ttl 参数"""
+        cache = LayeredCache()
+
+        def loader():
+            return "value"
+
+        value, level = cache.get_with_level(
+            "k",
+            loader=loader,
+            tags=["t1", "t2"],
+            local_ttl=60,
+            shared_ttl=300,
+        )
+        assert value == "value"
+        assert level == CacheLevel.SOURCE
+
+        local_entry = cache.get_entry_local("k")
+        shared_entry = cache.get_entry_shared("k")
+        assert local_entry is not None
+        assert shared_entry is not None
+        assert local_entry.tags == ["t1", "t2"]
+        assert shared_entry.tags == ["t1", "t2"]
+
+        local_ttl = local_entry.remaining_ttl()
+        shared_ttl = shared_entry.remaining_ttl()
+        assert local_ttl is not None and 59 <= local_ttl <= 61
+        assert shared_ttl is not None and 299 <= shared_ttl <= 301
+
+    def test_get_with_level_loader_returns_none(self):
+        """get_with_level 当 loader 返回 None 时返回 (None, SOURCE)"""
+        cache = LayeredCache()
+
+        value, level = cache.get_with_level("k", loader=lambda: None)
+        assert value is None
+        assert level == CacheLevel.SOURCE
+
+        assert cache.get_local("k") is None
+        assert cache.get_shared("k") is None
+
+    def test_get_with_level_no_loader_returns_none_level(self):
+        """get_with_level 无 loader 且未命中时返回 (None, None)"""
+        cache = LayeredCache()
+        value, level = cache.get_with_level("missing")
+        assert value is None
+        assert level is None
+
+    def test_get_with_level_also_counts_request_stats(self):
+        """get_with_level 调用也计入请求级统计"""
+        cache = LayeredCache()
+        cache.set_shared("k", "v")
+
+        cache.get_with_level("k")
+        cache.get_with_level("other")
+
+        stats = cache.get_stats()
+        overall = stats["overall"]
+        assert overall["accesses"] == 2
+        assert overall["hits"] == 1
+        assert overall["misses"] == 1
+        assert overall["hit_rate"] == 0.5
+
+    # ------------------------------------------------------------
+    # 新增：reset_stats 重置请求级统计测试
+    # ------------------------------------------------------------
+    def test_reset_stats_clears_request_level_stats(self):
+        """reset_stats 正确重置请求级统计"""
+        cache = LayeredCache()
+        cache.get("a", loader=lambda: 1)
+        cache.get("b", loader=lambda: 2)
+        cache.get("a")
+
+        stats_before = cache.get_stats()
+        assert stats_before["overall"]["accesses"] == 3
+
+        cache.reset_stats()
+
+        stats_after = cache.get_stats()
+        assert stats_after["overall"]["accesses"] == 0
+        assert stats_after["overall"]["hits"] == 0
+        assert stats_after["overall"]["misses"] == 0
+        assert stats_after["overall"]["hit_rate"] == 0.0
+        assert stats_after["overall"]["loader_calls"] == 0
+        assert stats_after["sizes"]["local"] == 2
+        assert stats_after["sizes"]["shared"] == 2
