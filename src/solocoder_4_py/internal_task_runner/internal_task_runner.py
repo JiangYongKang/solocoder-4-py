@@ -17,7 +17,6 @@ from .constants import (
     TaskType,
 )
 from .exceptions import (
-    InvalidScheduleError,
     TaskAlreadyRegisteredError,
     TaskExecutionError,
     TaskNotFoundError,
@@ -203,6 +202,30 @@ class InternalTaskRunner:
         """
         with self._lock:
             return self._get_task_or_raise(task_id).definition
+
+    def set_task_handler(
+        self, task_id: str, handler: Callable[..., Any]
+    ) -> TaskDefinition:
+        """动态替换任务的 handler
+
+        提供线程安全的 handler 替换接口，避免测试或运行时动态调整任务逻辑。
+        由于 ``_execute_single_run`` 入口处会快照 definition_snapshot，
+        本次运行（如果已在执行中）不会受到影响，后续运行将使用新 handler。
+
+        Args:
+            task_id: 任务ID
+            handler: 新的 handler 函数
+
+        Returns:
+            更新后的任务定义
+
+        Raises:
+            TaskNotFoundError: 如果任务不存在
+        """
+        with self._lock:
+            info = self._get_task_or_raise(task_id)
+            info.definition.handler = handler
+            return info.definition
 
     # ------------------------------------------------------------------
     # 任务生命周期控制

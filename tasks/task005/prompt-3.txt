@@ -1,0 +1,5 @@
+你实现的请求结果快照缓存功能模块存在以下问题，需要修复：
+1. get 方法中 _cleanup_expired() 批量清理之后仍保留了原有的逐条目 TTL 检查逻辑（snapshot_cache.py 第 95-99 行）。当条目被该逐条目检查而非 _cleanup_expired 捕获清理时，ttl_cleanups 统计不会递增。需要删除 get 方法中的冗余 TTL 检查代码，统一由 _cleanup_expired() 负责过期清理。
+2. _set_internal 方法接受 ttl 参数但从未实际使用：方法签名包含 ttl: Optional[float] = None 参数，但方法体内不将其传递给 CacheEntry 也不存储。用户通过 set(..., ttl=60) 设置的逐条目 TTL 完全无效，只有 default_ttl 起作用。需要在 CacheEntry 中增加 per-entry ttl 字段、在 _set_internal 写入时存储、在 _cleanup_expired 中按 entry.ttl 做失效判断。
+3. has 方法在版本校验失败时返回 False 但不驱逐过期条目：当条目存在但 check_versions_valid 返回 False 时，has 直接返回 False 而该失效条目仍保留在内存中。这与 get 方法在版本校验失败时主动清理的行为不一致，导致 len 和 get_stats 返回的 size 虚高。需要在 check_versions_valid 返回 False 时调用 _evict_internal 清理该条目。
+4. 重新运行 poetry run pytest tests/request_snapshot_cache/ -q，需要让所有测试通过。

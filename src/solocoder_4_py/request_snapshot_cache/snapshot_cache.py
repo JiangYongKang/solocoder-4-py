@@ -17,6 +17,7 @@ class CacheEntry:
     data_entities: List[str]
     entity_versions: Dict[str, int]
     created_at: float
+    ttl: Optional[float] = None
     accessed_at: float = field(default_factory=time.time)
     hit_count: int = 0
 
@@ -48,14 +49,17 @@ class RequestSnapshotCache:
         }
 
     def _cleanup_expired(self) -> int:
-        if self._default_ttl is None:
+        if self._default_ttl is None and not any(
+            entry.ttl is not None for entry in self._cache.values()
+        ):
             return 0
 
         now = time.time()
         expired_keys: List[str] = []
 
         for cache_key, entry in self._cache.items():
-            if now - entry.created_at > self._default_ttl:
+            effective_ttl = entry.ttl if entry.ttl is not None else self._default_ttl
+            if effective_ttl is not None and (now - entry.created_at > effective_ttl):
                 expired_keys.append(cache_key)
 
         for cache_key in expired_keys:
@@ -91,12 +95,6 @@ class RequestSnapshotCache:
                 self._evict_internal(cache_key)
                 self._stats["misses"] += 1
                 return None
-
-            if self._default_ttl is not None:
-                if time.time() - entry.created_at > self._default_ttl:
-                    self._evict_internal(cache_key)
-                    self._stats["misses"] += 1
-                    return None
 
             entry.touch()
             self._stats["hits"] += 1
@@ -157,6 +155,7 @@ class RequestSnapshotCache:
             data_entities=entities,
             entity_versions=entity_versions,
             created_at=time.time(),
+            ttl=ttl,
         )
 
         self._cache[cache_key] = entry
@@ -226,9 +225,12 @@ class RequestSnapshotCache:
             if cache_key not in self._cache:
                 return False
             entry = self._cache[cache_key]
-            return self._version_manager.check_versions_valid(
+            if not self._version_manager.check_versions_valid(
                 cache_key, entry.entity_versions
-            )
+            ):
+                self._evict_internal(cache_key)
+                return False
+            return True
 
     def get_entry(self, request_params: Dict[str, Any],
                   data_entities: Optional[List[str]] = None) -> Optional[CacheEntry]:

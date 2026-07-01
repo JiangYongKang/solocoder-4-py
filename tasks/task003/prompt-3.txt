@@ -1,0 +1,6 @@
+你实现的缓存预热编排功能模块存在以下问题，需要修复：
+1. topology.py 中保留了 from collections import deque 导入语句，但 Kahn 算法已改用 heapq 实现优先级排序，deque 在模块中完全未被引用。需要删除该无用 import。
+2. test_cache_warmup.py 中存在一行孤立的 orch.get_cached_data # no-op 语句，只引用了方法对象而未实际调用，属于无操作残留代码。需要删除该行。
+3. orchestrator.py 的 _handle_failure 方法在 SKIP_DEPENDENTS 分支中持锁调用 TopologySorter.get_all_downstream，该函数对 ctx.tasks 做 BFS 遍历。若任务图深度较大（如数百级链式依赖），锁持有时间与遍历复杂度线性相关。需要将 get_all_downstream 调用移出锁区块，或改为在锁外操作传入的局部变量副本。
+4. README.md 章节编号断裂——使用示例（第 4 章）以 4.6 节结束后直接跳至第 7 章，中间缺失第 5、第 6 章。需要重新编排章节号使其连续，或补充缺失章节标题。
+5. 重新运行 poetry run pytest tests/cache_warmup/ -q，需要让所有测试通过。

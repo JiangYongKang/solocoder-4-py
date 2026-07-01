@@ -753,9 +753,10 @@ class TestTimeoutExceptionRaised:
         tx_id = coord.begin_transaction()
         coord.register_participant(tx_id, p)
 
-        state = coord.execute_transaction(tx_id)
-        # execute_transaction 捕获超时并调用 abort_transaction
-        assert state == TransactionState.TIMEOUT_ABORTED
+        with pytest.raises(TimeoutDecisionAbortedError):
+            coord.execute_transaction(tx_id)
+        # 异常抛出前已完成 abort，状态应为 TIMEOUT_ABORTED
+        assert coord.get_transaction_state(tx_id) == TransactionState.TIMEOUT_ABORTED
 
 
 class TestCommitPartialFailure:
@@ -789,15 +790,59 @@ class TestCommitPartialFailure:
         with pytest.raises(CommitFailedError) as excinfo:
             coord.commit_transaction(tx_id)
 
-        # 虽然失败了，但协调器决策仍是 COMMITTED（2PC 语义）
+        # 现在状态是 COMMIT_PARTIALLY_FAILED（中间状态），不是 COMMITTED
         assert "db crashed" in str(excinfo.value)
-        assert coord.get_transaction_state(tx_id) == TransactionState.COMMITTED
+        assert coord.get_transaction_state(tx_id) == TransactionState.COMMIT_PARTIALLY_FAILED
         # good 参与者已提交
         assert p_good.get_state(tx_id) == ParticipantState.COMMITTED
+        # bad 参与者仍为 PREPARED 或 COMMIT_FAILED
+        assert p_bad.get_state(tx_id) in (
+            ParticipantState.PREPARED,
+            ParticipantState.COMMIT_FAILED,
+        )
+        # 异常对象附带失败参与者列表
+        assert excinfo.value.failed_participants == ["bad"]
+        assert excinfo.value.committed_participants == ["good"]
+        # 查询方法可用
+        assert coord.has_incomplete_commit(tx_id) is True
+        assert coord.get_commit_failed_participants(tx_id) == ["bad"]
+
+    def test_retry_commit_succeeds_after_fix(self) -> None:
+        """retry_commit 可以成功完成之前失败的参与者"""
+        coord = TransactionCoordinator()
+        bad_state = {"should_fail": True}
+
+        def flaky_commit(tx_id: str) -> None:
+            if bad_state["should_fail"]:
+                raise RuntimeError("network partition")
+
+        p = TransactionParticipant("flaky")
+        p.set_callbacks(on_prepare=lambda tx: True, on_commit=flaky_commit)
+
+        tx_id = coord.begin_transaction()
+        coord.register_participant(tx_id, p)
+
+        coord.prepare_transaction(tx_id)
+        with pytest.raises(CommitFailedError):
+            coord.commit_transaction(tx_id)
+
+        # 第一次失败
+        assert coord.has_incomplete_commit(tx_id) is True
+        assert coord.retry_commit(tx_id) is False
+        assert coord.get_transaction_state(tx_id) == TransactionState.COMMIT_PARTIALLY_FAILED
+
+        # 修复后重试
+        bad_state["should_fail"] = False
+        assert coord.retry_commit(tx_id) is True
+        assert coord.get_transaction_state(tx_id) == TransactionState.COMMITTED
+        assert p.get_state(tx_id) == ParticipantState.COMMITTED
+        assert coord.has_incomplete_commit(tx_id) is False
+        assert coord.get_commit_failed_participants(tx_id) == []
 
     def test_execute_transaction_propagates_commit_failure(self) -> None:
-        """execute_transaction 不应静默吞掉 CommitFailedError"""
-        coord = TransactionCoordinator()
+        """execute_transaction 不应静默吞掉 CommitFailedError（重试后仍失败）"""
+        # 设置 max_retry_attempts=1 以快速失败
+        coord = TransactionCoordinator(max_retry_attempts=1)
         p_good = TransactionParticipant("good")
         p_good.set_callbacks(on_prepare=lambda tx: True, on_commit=lambda tx: None)
         p_bad = TransactionParticipant("bad")
@@ -810,19 +855,53 @@ class TestCommitPartialFailure:
         coord.register_participant(tx_id, p_good)
         coord.register_participant(tx_id, p_bad)
 
-        with pytest.raises(CommitFailedError):
+        with pytest.raises(CommitFailedError) as excinfo:
             coord.execute_transaction(tx_id)
 
-        # 事务仍标记为 COMMITTED
-        assert coord.get_transaction_state(tx_id) == TransactionState.COMMITTED
+        # 异常对象包含失败详情
+        assert "重试" in str(excinfo.value)
+        assert excinfo.value.failed_participants == ["bad"]
+        assert excinfo.value.committed_participants == ["good"]
+        # 事务保持 COMMIT_PARTIALLY_FAILED
+        assert coord.get_transaction_state(tx_id) == TransactionState.COMMIT_PARTIALLY_FAILED
+
+    def test_execute_transaction_commit_retries_until_success(self) -> None:
+        """execute_transaction 会自动重试 commit，直到成功或达到最大重试次数"""
+        coord = TransactionCoordinator(max_retry_attempts=3)
+        fail_count = {"n": 0}
+
+        def commit_with_failures(tx_id: str) -> None:
+            if fail_count["n"] < 2:
+                fail_count["n"] += 1
+                raise RuntimeError(f"fail #{fail_count['n']}")
+            # 第三次成功
+
+        p = TransactionParticipant("eventually-consistent")
+        p.set_callbacks(on_prepare=lambda tx: True, on_commit=commit_with_failures)
+
+        tx_id = coord.begin_transaction()
+        coord.register_participant(tx_id, p)
+
+        # 应该自动重试并最终成功
+        final_state = coord.execute_transaction(tx_id)
+        assert final_state == TransactionState.COMMITTED
+        assert fail_count["n"] == 2  # 失败了 2 次，第 3 次成功
 
     def test_commit_idempotent_after_partial_failure(self) -> None:
-        """对已 COMMITTED 的事务再次 commit 应幂等返回，不抛异常"""
+        """对 COMMIT_PARTIALLY_FAILED 的事务再次调用 commit_transaction 会继续执行"""
         coord = TransactionCoordinator()
+        fail_once = {"failed": False}
+
+        def commit_fail_once(tx_id: str) -> None:
+            if not fail_once["failed"]:
+                fail_once["failed"] = True
+                raise RuntimeError("fail-once")
+            # 第二次成功
+
         p1 = TransactionParticipant("p1")
         p1.set_callbacks(
             on_prepare=lambda tx: True,
-            on_commit=lambda tx: (_ for _ in ()).throw(RuntimeError("fail-once")),
+            on_commit=commit_fail_once,
         )
 
         tx_id = coord.begin_transaction()
@@ -832,8 +911,66 @@ class TestCommitPartialFailure:
         with pytest.raises(CommitFailedError):
             coord.commit_transaction(tx_id)
 
-        # 第二次调用应幂等返回（已 COMMITTED）
-        coord.commit_transaction(tx_id)  # 不应抛异常
+        assert coord.get_transaction_state(tx_id) == TransactionState.COMMIT_PARTIALLY_FAILED
+        # 第二次调用 commit_transaction 会继续执行（或用 retry_commit）
+        coord.commit_transaction(tx_id)  # 这次应该成功
+        assert coord.get_transaction_state(tx_id) == TransactionState.COMMITTED
+
+    def test_retry_commit_on_committed_is_noop(self) -> None:
+        """对已 COMMITTED 的事务调用 retry_commit 返回 True，无副作用"""
+        tracker = CallTracker()
+        coord = TransactionCoordinator()
+        p = TransactionParticipant("p1")
+        p.set_callbacks(on_prepare=tracker.prepare, on_commit=tracker.commit)
+
+        tx_id = coord.begin_transaction()
+        coord.register_participant(tx_id, p)
+        coord.prepare_transaction(tx_id)
+        coord.commit_transaction(tx_id)
+
+        assert coord.get_transaction_state(tx_id) == TransactionState.COMMITTED
+        commit_count_before = tracker.commit_calls.get(tx_id, 0)
+        assert coord.retry_commit(tx_id) is True
+        # 不产生额外副作用
+        assert tracker.commit_calls.get(tx_id, 0) == commit_count_before
+
+    def test_retry_commit_on_non_committing_state_raises(self) -> None:
+        """对非 commit 阶段的事务调用 retry_commit 应抛错"""
+        coord = TransactionCoordinator()
+        tx_id = coord.begin_transaction()
+        coord.prepare_transaction(tx_id)
+        coord.abort_transaction(tx_id)
+
+        with pytest.raises(TransactionStateError):
+            coord.retry_commit(tx_id)
+
+    def test_commit_failed_error_contains_details(self) -> None:
+        """CommitFailedError 异常应包含失败和成功参与者列表"""
+        coord = TransactionCoordinator()
+        p1 = TransactionParticipant("p1")
+        p1.set_callbacks(
+            on_prepare=lambda tx: True,
+            on_commit=lambda tx: (_ for _ in ()).throw(RuntimeError("err1")),
+        )
+        p2 = TransactionParticipant("p2")
+        p2.set_callbacks(on_prepare=lambda tx: True, on_commit=lambda tx: None)
+        p3 = TransactionParticipant("p3")
+        p3.set_callbacks(
+            on_prepare=lambda tx: True,
+            on_commit=lambda tx: (_ for _ in ()).throw(RuntimeError("err3")),
+        )
+
+        tx_id = coord.begin_transaction()
+        coord.register_participant(tx_id, p1)
+        coord.register_participant(tx_id, p2)
+        coord.register_participant(tx_id, p3)
+
+        coord.prepare_transaction(tx_id)
+        with pytest.raises(CommitFailedError) as excinfo:
+            coord.commit_transaction(tx_id)
+
+        assert excinfo.value.failed_participants == ["p1", "p3"]
+        assert excinfo.value.committed_participants == ["p2"]
 
 
 class TestAbortCallbackFailure:

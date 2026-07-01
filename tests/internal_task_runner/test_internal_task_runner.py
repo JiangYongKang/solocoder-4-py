@@ -705,8 +705,7 @@ class TestRunHistory:
                 return h
 
             # 动态替换 handler
-            info = runner2._tasks["m1"]
-            info.definition.handler = make_handler(i)
+            runner2.set_task_handler("m1", make_handler(i))
             runner2.trigger("m1")
 
         return runner2, clock
@@ -890,15 +889,14 @@ class TestRunnerStats:
         # 执行一次 t1（成功）和 m1 3 次（2 次成功 1 次失败）
         runner.tick()  # t1 执行
 
-        info = runner._tasks["m1"]
-        info.definition.handler = MagicMock(return_value="ok")
+        runner.set_task_handler("m1", MagicMock(return_value="ok"))
         runner.trigger("m1")
         runner.trigger("m1")
 
         def fail(**kw):
             raise RuntimeError("x")
 
-        info.definition.handler = fail
+        runner.set_task_handler("m1", fail)
         runner.trigger("m1")
 
         s = runner.get_stats()
@@ -1633,9 +1631,8 @@ class TestRaceAndDynamicHandler:
         )
         runner.activate("dyn")
 
-        # 动态替换：直接改 definition.handler
-        info = runner.get_task("dyn")
-        info.definition.handler = new_handler
+        # 动态替换：使用 set_task_handler 公共 API
+        runner.set_task_handler("dyn", new_handler)
 
         r = runner.trigger("dyn")
         assert r.is_success
@@ -1674,10 +1671,9 @@ class TestRaceAndDynamicHandler:
         t.start()
         start_e.wait(timeout=5)
 
-        # 运行中尝试替换 handler
-        info = runner.get_task("mid")
-        original_handler = info.definition.handler
-        info.definition.handler = lambda **kw: "injected"
+        # 运行中尝试替换 handler（使用公共 API）
+        original_handler = runner.get_definition("mid").handler
+        runner.set_task_handler("mid", lambda **kw: "injected")
 
         # 让 handler 结束
         wait_e.set()
@@ -1688,7 +1684,7 @@ class TestRaceAndDynamicHandler:
         assert result_holder[0].result == "blocking-result"
 
         # 恢复（保持测试环境整洁）
-        info.definition.handler = original_handler
+        runner.set_task_handler("mid", original_handler)
 
         runner.shutdown(wait=True)
 

@@ -1,0 +1,5 @@
+你实现的内部任务运行器功能模块存在以下问题，需要修复：
+1. README.md 的文档说明严重不足：仅在"模块功能概览"中使用四条单行要点概括超时机制、重试延迟、周期追赶补偿和竞态防护，缺少独立章节、原理说明、代码示例、策略对比表和注意事项。使用者无法通过文档了解超时的边界行为（如 Python 线程无法强制 kill）、重试延迟策略（首次不延迟、sleep_provider 注入）、追赶补偿的两档策略对比（catch_up=True/False）和竞态防护的锁内二次校验机制。需要在 README.md 中增加四个独立章节（## Handler 超时机制、## 重试延迟策略、## 周期任务追赶补偿、## 触发器竞态防护），每个章节包含原理说明、代码示例和注意事项。
+2. InternalTaskRunner 缺少 set_task_handler 公共方法：测试代码通过 runner._tasks["m1"].definition.handler 直接操作私有字段来替换 handler，与 _tasks 和 TaskRuntimeInfo 等内部数据结构强耦合。需要实现 InternalTaskRunner.set_task_handler(task_id, handler) 公共方法，并重构所有涉及 handler 替换的测试改用该公共方法。
+3. internal_task_runner.py 中存在无效的 InvalidScheduleError 导入：register 方法中的 InvalidScheduleError 校验分支已删除，该异常在当前模块中不再有任何 raise 点，import 语句成为死引用。需要从 internal_task_runner.py 中移除该导入。
+4. 重新运行 poetry run pytest tests/internal_task_runner/ -q，需要让所有测试通过。

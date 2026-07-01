@@ -1,0 +1,5 @@
+你实现的事务协调功能模块存在以下问题，需要修复：
+1. README.md 未同步更新：状态机图缺少 ABORTING→retry_abort 路径，文档中缺少 Commit 阶段部分失败的处理说明和参与者 Abort 回调失败处置策略的描述，测试数量仍标注为 51 个（实际 62 个），运行命令使用了 python -m pytest 而非 poetry run pytest。需要逐节对照 coordinator.py 的实际 API 重新编写 README，确保包含 CommitFailedError 异常契约、retry_abort 方法使用说明和 abort 失败处置策略。
+2. commit_transaction 方法在部分参与者 commit 失败时先设置协调器状态为 COMMITTED 再抛出 CommitFailedError，而失败参与者端状态回退到 PREPARED 或 COMMIT_FAILED。调用者捕获异常后查询 get_transaction_state 得到 COMMITTED，但实际存在未完成提交的参与者。需要在 CommitFailedError 异常对象中附带失败参与者列表，或引入 COMMIT_PARTIALLY_FAILED 等中间状态以明确区分「全部提交成功」和「部分提交失败」。
+3. execute_transaction 方法在超时后调用 abort_transaction，若 abort 存在部分参与者回调失败则协调器停留在 ABORTING 非终态，直接返回给调用者，破坏了"一键执行返回终态"的语义。需要在 execute_transaction 中加入 abort 失败的重试循环或兜底处理，确保在所有路径下均返回终态。
+4. 重新运行 poetry run pytest tests/transaction_coordination/ -q，需要让所有测试通过。

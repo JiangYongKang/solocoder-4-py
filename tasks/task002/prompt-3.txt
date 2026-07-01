@@ -1,0 +1,5 @@
+你实现的分层缓存功能模块存在以下问题，需要修复：
+1. README.md 的 API 参考表格中，get_with_level 方法的签名未体现新增的 loader、tags、ttl、local_ttl、shared_ttl 参数；get_or_load 方法的行也未反映返回类型为 Optional[T]。需要逐行对照 layered_cache.py 中两个方法的实际函数签名更新 API 表格。
+2. LayeredCache 的 loader 调用计数使用了独立的 _stats_loader_calls 整型变量，而非复用 CacheStats 数据类中已定义的 loader_calls 字段。这导致 _request_stats.to_dict() 返回的 loader_calls 始终为 0，实际计数需要通过 _stats_loader_calls 单独拼入 get_stats 返回值。需要统一使用 _request_stats.loader_calls 进行计数和读取，消除内部状态不一致。
+3. 处理共享条目永不过期（expires_at=None）的回填逻辑存在对 SingleLevelCache 内部对象可变性的隐式依赖：先调用 local.set() 写入（此时会应用 local_ttl），再通过 local.get_entry() 取出条目并直接修改其 expires_at 为 None。若 SingleLevelCache 将来改为返回条目副本，该逻辑将失效。需要在 SingleLevelCache 层面增加显式支持永不过期语义的能力（如 set 方法中 ttl=None 时表示永不过期而非回退到 default_ttl），或重构回填逻辑不再绕过接口约束。
+4. 重新运行 poetry run pytest tests/layered_cache/ -q，需要让所有测试通过。

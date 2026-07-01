@@ -1245,7 +1245,6 @@ class TestConcurrentWarmupRuns:
         run_a = orch.create_warmup_run("run-A", failure_strategy=FailureStrategy.SKIP_DEPENDENTS)
         orch.register_task(run_a, WarmupTask("a-up", ))
         orch.register_task(run_a, WarmupTask("a-down", dependencies=["a-up"]))
-        orch.get_cached_data  # no-op
 
         # Run B: ABORT_ALL
         run_b = orch.create_warmup_run("run-B", failure_strategy=FailureStrategy.ABORT_ALL)

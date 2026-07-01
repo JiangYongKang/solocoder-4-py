@@ -10,6 +10,7 @@ from .constants import (
     TransactionState,
 )
 from .exceptions import (
+    AbortFailedError,
     CommitFailedError,
     ParticipantAlreadyRegisteredError,
     PrepareFailedError,
@@ -30,6 +31,7 @@ class TransactionContext:
     prepared_participants: Set[str] = field(default_factory=set)
     failed_participants: Set[str] = field(default_factory=set)
     committed_participants: Set[str] = field(default_factory=set)
+    commit_failed_participants: Set[str] = field(default_factory=set)
     aborted_participants: Set[str] = field(default_factory=set)
     abort_failed_participants: Set[str] = field(default_factory=set)
     prepare_started_at: Optional[float] = None
@@ -54,11 +56,15 @@ class TransactionCoordinator:
     def __init__(
         self,
         prepare_timeout_seconds: float = 30.0,
+        max_retry_attempts: int = 3,
         clock: Optional[Callable[[], float]] = None,
     ) -> None:
         if prepare_timeout_seconds <= 0:
             raise ValueError("prepare_timeout_seconds 必须为正数")
+        if max_retry_attempts < 0:
+            raise ValueError("max_retry_attempts 必须为非负整数")
         self._prepare_timeout = prepare_timeout_seconds
+        self._max_retry_attempts = max_retry_attempts
         self._clock = clock if clock is not None else time.monotonic
         self._transactions: Dict[str, TransactionContext] = {}
         self._lock = Lock()
@@ -232,6 +238,10 @@ class TransactionCoordinator:
         """执行阶段二：提交事务
 
         必须所有参与者均 PREPARED 才能提交（或已经 COMMITTED 幂等返回）。
+
+        注意：若某参与者 commit 回调失败，该参与者会被标记到 commit_failed_participants，
+        协调器保持 COMMIT_PARTIALLY_FAILED 状态。调用者需通过 retry_commit() 重试，
+        直到所有参与者成功 commit（协调器转为 COMMITTED）。
         """
         with self._lock:
             ctx = self._require_transaction(tx_id)
@@ -244,7 +254,11 @@ class TransactionCoordinator:
                     f"事务 {tx_id} 已决策为 {ctx.decision.value}，不能 commit"
                 )
 
-            if ctx.state not in (TransactionState.PREPARED, TransactionState.COMMITTING):
+            if ctx.state not in (
+                TransactionState.PREPARED,
+                TransactionState.COMMITTING,
+                TransactionState.COMMIT_PARTIALLY_FAILED,
+            ):
                 raise TransactionStateError(
                     f"事务 {tx_id} 处于 {ctx.state.value}，需要先 prepare 成功才能 commit"
                 )
@@ -257,38 +271,100 @@ class TransactionCoordinator:
                 )
 
             ctx.state = TransactionState.COMMITTING
+            if not ctx.final_decision_made:
+                ctx.final_decision_made = True
+                ctx.decision = TransactionState.COMMITTED
 
-        errors = []
-        for pid in list(ctx.participants_order):
+        all_success = self._do_commit_participants(tx_id, list(ctx.participants_order))
+
+        with self._lock:
+            ctx = self._transactions[tx_id]
+            if not all_success:
+                error_details = "; ".join(ctx.errors[-len(ctx.commit_failed_participants) :])
+                raise CommitFailedError(
+                    message=f"事务 {tx_id} 部分参与者 commit 失败：{error_details}，需调用 retry_commit() 重试",
+                    failed_participants=sorted(ctx.commit_failed_participants),
+                    committed_participants=sorted(ctx.committed_participants),
+                )
+
+    def _do_commit_participants(self, tx_id: str, pids_to_commit: List[str]) -> bool:
+        """执行具体的参与者 commit 操作
+
+        :returns: True 表示所有指定参与者均 commit 成功；False 表示存在失败
+        """
+        all_success = True
+        for pid in pids_to_commit:
             with self._lock:
                 ctx = self._transactions[tx_id]
                 participant = ctx.participants[pid]
                 if pid in ctx.committed_participants:
+                    ctx.commit_failed_participants.discard(pid)
                     continue
             try:
                 participant.commit(tx_id)
                 with self._lock:
                     ctx = self._transactions[tx_id]
                     ctx.committed_participants.add(pid)
+                    ctx.commit_failed_participants.discard(pid)
             except Exception as exc:
-                errors.append(f"参与者 {pid} commit 失败：{exc}")
+                all_success = False
                 with self._lock:
                     ctx = self._transactions[tx_id]
-                    ctx.errors.append(str(exc))
+                    ctx.commit_failed_participants.add(pid)
+                    ctx.errors.append(f"参与者 {pid} commit 失败：{exc}")
 
         with self._lock:
             ctx = self._transactions[tx_id]
-            if errors:
-                # 一旦进入 COMMITTING 即视为最终决策为 COMMITTED
-                ctx.final_decision_made = True
-                ctx.decision = TransactionState.COMMITTED
-                ctx.state = TransactionState.COMMITTED
-                raise CommitFailedError(
-                    f"事务 {tx_id} 部分参与者 commit 失败：{'; '.join(errors)}"
+            if ctx.state in (
+                TransactionState.COMMITTING,
+                TransactionState.COMMIT_PARTIALLY_FAILED,
+            ):
+                if not ctx.commit_failed_participants:
+                    ctx.state = TransactionState.COMMITTED
+                else:
+                    ctx.state = TransactionState.COMMIT_PARTIALLY_FAILED
+
+        return all_success
+
+    def retry_commit(self, tx_id: str) -> bool:
+        """重试 commit 那些之前失败的参与者
+
+        :returns: True 表示所有参与者均已成功 commit（事务进入 COMMITTED）
+                   False 表示仍有参与者 commit 失败（保持 COMMIT_PARTIALLY_FAILED）
+        """
+        with self._lock:
+            ctx = self._require_transaction(tx_id)
+
+            if ctx.state == TransactionState.COMMITTED:
+                return True
+
+            if ctx.state not in (
+                TransactionState.COMMITTING,
+                TransactionState.COMMIT_PARTIALLY_FAILED,
+            ):
+                raise TransactionStateError(
+                    f"事务 {tx_id} 处于 {ctx.state.value}，不在 commit 阶段，不能 retry_commit"
                 )
-            ctx.final_decision_made = True
-            ctx.decision = TransactionState.COMMITTED
-            ctx.state = TransactionState.COMMITTED
+
+            failed_pids = list(ctx.commit_failed_participants)
+            if not failed_pids:
+                if ctx.state == TransactionState.COMMIT_PARTIALLY_FAILED:
+                    ctx.state = TransactionState.COMMITTED
+                return True
+
+        return self._do_commit_participants(tx_id, failed_pids)
+
+    def has_incomplete_commit(self, tx_id: str) -> bool:
+        """查询是否存在未成功 commit 的参与者"""
+        with self._lock:
+            ctx = self._require_transaction(tx_id)
+            return bool(ctx.commit_failed_participants)
+
+    def get_commit_failed_participants(self, tx_id: str) -> List[str]:
+        """查询 commit 失败、需要重试的参与者 ID 列表"""
+        with self._lock:
+            ctx = self._require_transaction(tx_id)
+            return sorted(ctx.commit_failed_participants)
 
     # ------------------------------------------------------------
     # 阶段二：Abort
@@ -413,11 +489,19 @@ class TransactionCoordinator:
     # 一键执行
     # ------------------------------------------------------------
     def execute_transaction(self, tx_id: str) -> TransactionState:
-        """完整执行 2PC 流程（prepare → commit/abort）
+        """完整执行 2PC 流程（prepare → commit/abort），保证返回终态或抛明确异常。
 
-        :returns: 最终事务状态
-        :raises TimeoutDecisionAbortedError: prepare 阶段超时，决策中止
-        :raises CommitFailedError: commit 阶段部分参与者提交失败（事务仍标记为 COMMITTED）
+        本方法遵循"一键执行返回终态"的语义：
+          1. 若事务已处于终态（COMMITTED/ABORTED/TIMEOUT_ABORTED），直接返回
+          2. 执行 prepare，根据结果决策 commit 或 abort
+          3. 若 commit/abort 过程中存在参与者回调失败，自动重试（最多 max_retry_attempts 次）
+          4. 若重试后仍有失败，抛出包含失败参与者列表的异常
+          5. 所有成功路径均返回终态（COMMITTED/ABORTED/TIMEOUT_ABORTED）
+
+        :returns: 最终事务状态（终态之一）
+        :raises TimeoutDecisionAbortedError: prepare 阶段超时（已成功执行 abort）
+        :raises CommitFailedError: commit 阶段部分参与者提交失败（即使重试后仍失败）
+        :raises AbortFailedError: abort 阶段部分参与者中止失败（即使重试后仍失败）
         :raises TransactionStateError: 状态机非法转换等错误
         """
         # 已处于终态的事务直接返回（幂等）
@@ -429,19 +513,60 @@ class TransactionCoordinator:
         try:
             prepared = self.prepare_transaction(tx_id)
         except TimeoutDecisionAbortedError:
-            self.abort_transaction(tx_id)
-            with self._lock:
-                ctx = self._transactions.get(tx_id)
-                return ctx.state if ctx else TransactionState.ABORTED
+            # 超时场景：先执行 abort，确保所有参与者回滚
+            self._execute_abort_with_retry(tx_id)
+            raise
 
         if prepared:
-            # commit_transaction 内部已处理 COMMITTED 幂等返回，
-            # 若抛出 CommitFailedError 或 TransactionStateError 则由调用者处理
-            self.commit_transaction(tx_id)
+            try:
+                self.commit_transaction(tx_id)
+            except CommitFailedError:
+                # 部分参与者 commit 失败，自动重试
+                success = self._retry_with_limit(tx_id, self.retry_commit)
+                if not success:
+                    with self._lock:
+                        ctx = self._transactions[tx_id]
+                        raise CommitFailedError(
+                            message=f"事务 {tx_id} commit 重试 {self._max_retry_attempts} 次后仍有失败",
+                            failed_participants=sorted(ctx.commit_failed_participants),
+                            committed_participants=sorted(ctx.committed_participants),
+                        )
         else:
-            self.abort_transaction(tx_id)
+            self._execute_abort_with_retry(tx_id)
 
         return self.get_transaction_state(tx_id)
+
+    def _execute_abort_with_retry(self, tx_id: str) -> None:
+        """执行 abort 并在失败时自动重试，若最终仍失败则抛 AbortFailedError"""
+        try:
+            self.abort_transaction(tx_id)
+        except Exception:
+            pass  # abort_transaction 自身不抛异常，但可能有失败参与者
+
+        success = self._retry_with_limit(tx_id, self.retry_abort)
+        if not success:
+            with self._lock:
+                ctx = self._transactions[tx_id]
+                raise AbortFailedError(
+                    f"事务 {tx_id} abort 重试 {self._max_retry_attempts} 次后仍有失败："
+                    f"{sorted(ctx.abort_failed_participants)}"
+                )
+
+    def _retry_with_limit(
+        self, tx_id: str, retry_fn: Callable[[str], bool]
+    ) -> bool:
+        """有限次重试指定操作
+
+        :returns: True 表示最终成功；False 表示重试后仍失败
+        """
+        attempts = 0
+        success = False
+        while attempts < self._max_retry_attempts:
+            success = retry_fn(tx_id)
+            if success:
+                break
+            attempts += 1
+        return success
 
     # ------------------------------------------------------------
     # 超时判定

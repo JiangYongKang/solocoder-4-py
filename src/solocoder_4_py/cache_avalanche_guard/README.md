@@ -34,7 +34,7 @@
 **防护策略**：
 - 持续追踪每个键在滑动时间窗口内的访问频率
 - 当访问频率超过阈值时，标记为"热点键"
-- 后台线程定期检查热点键，当剩余 TTL 低于默认 TTL 的 30% 时自动续期
+- 后台线程定期检查热点键，当剩余 TTL 低于条目自身 TTL 的 30% 时自动续期
 - 续期时同样应用过期时间抖动
 
 **配置参数**：
@@ -43,7 +43,7 @@
 - `background_renew_interval_seconds`：后台续期检查间隔（秒），默认 60
 - `enable_background_renew`：是否启用后台续期，默认 True
 
-### 3. 单飞重建锁 (Single Flight Rebuild)
+### 3. 单飞重建锁与重建策略 (Single Flight Rebuild & RebuildStrategy)
 
 **问题场景**：缓存未命中时，多个并发请求同时调用数据加载函数，导致后端压力倍增。
 
@@ -55,6 +55,45 @@
 
 **配置参数**：
 - `rebuild_timeout_seconds`：重建超时时间（秒），默认 5
+
+**重建策略（RebuildStrategy）**：
+
+本模块提供两种重建策略，可在调用 `get()` 时通过 `rebuild_strategy` 参数指定：
+
+**SYNC（同步策略，默认）**：
+- 调用方阻塞等待，直至重建完成或超时
+- 重建成功返回真实数据，超时返回降级值
+- 适用于对数据一致性要求高、重建耗时短的场景
+
+```python
+from solocoder_4_py.cache_avalanche_guard import RebuildStrategy
+
+result = guard.get(
+    "key",
+    loader=lambda: load_data(),
+    degraded_value="fallback",
+    rebuild_strategy=RebuildStrategy.SYNC,  # 默认值，可省略
+)
+```
+
+**ASYNC（异步策略）**：
+- 调用方立即返回降级值，不等待重建完成
+- 重建工作由后台守护线程异步执行
+- 重建成功后自动更新缓存，后续请求获得真实数据
+- 适用于重建耗时较长、调用方对延迟敏感的场景
+- **注意**：使用 ASYNC 策略时建议始终提供 `degraded_value`，未提供时返回 `None` 作为占位
+
+```python
+from solocoder_4_py.cache_avalanche_guard import RebuildStrategy
+
+result = guard.get(
+    "slow_loading_data",
+    loader=lambda: expensive_database_query(),  # 可能耗时 30 秒
+    degraded_value={"status": "loading", "data": None},
+    rebuild_strategy=RebuildStrategy.ASYNC,
+)
+print(result)  # 立即返回 {"status": "loading", "data": None}
+```
 
 **状态流转**：
 ```
@@ -83,9 +122,20 @@ VALID (更新)    DEGRADED (降级)
 ### 降级触发条件
 
 1. **缓存未命中 + 无 loader**：返回 `degraded_value`（如果提供）或 None
-2. **重建超时**：等待重建超过 `rebuild_timeout_seconds`，返回降级值
-3. **重建异常**：loader 函数抛出异常，返回降级值
+2. **重建超时**：等待重建超过 `rebuild_timeout_seconds`，返回降级值并自动持久化
+3. **重建异常**：loader 函数抛出异常，返回降级值并自动持久化
 4. **缓存已降级**：直接返回降级值
+5. **ASYNC 策略**：立即返回 `degraded_value`（若提供）并触发后台重建，同时持久化降级值
+
+### 降级持久化机制
+
+除了显式的"重建异常"场景，以下路径同样会自动将降级值写入缓存并标记为 `DEGRADED` 状态：
+
+- **非重建方等待超时**：当请求方不是重建锁持有者，等待重建超过 `rebuild_timeout_seconds` 后，`degraded_value` 会被写入缓存并设置独立 TTL
+- **ASYNC 策略触发**：使用 `RebuildStrategy.ASYNC` 时，返回给调用方的降级值会被同时写入缓存
+- **降级值的独立 TTL**：所有持久化的降级值均使用 `degraded_ttl_seconds` 作为过期时间（默认 10 秒）
+
+**持久化后的效果**：后续对同一键的请求即使不再传入 `degraded_value` 参数，也能从缓存中读取到降级值并获得保护，直至降级值 TTL 过期后触发下一次重建尝试。
 
 ### 降级恢复
 
@@ -254,6 +304,91 @@ for t in threads:
 
 print(f"Loader called: {call_count[0]} times")  # 仅 1 次
 print(f"All got results: {len(results) == 100}")  # True
+```
+
+### 异步重建策略 (ASYNC)
+
+```python
+from solocoder_4_py.cache_avalanche_guard import RebuildStrategy
+
+# 使用 ASYNC 策略，调用方无需等待重建完成
+result = guard.get(
+    "slow_loading_data",
+    loader=lambda: expensive_database_query(),
+    degraded_value={"status": "loading", "data": None},
+    rebuild_strategy=RebuildStrategy.ASYNC,
+)
+
+# 立即返回降级值，后台异步执行重建
+print(result)  # {"status": "loading", "data": None}
+
+# 稍等片刻，后台重建完成
+time.sleep(1)
+
+# 后续请求获取到真实数据
+result_after = guard.get("slow_loading_data")
+print(result_after)  # 真实数据
+
+# 结合自定义 TTL
+result = guard.get(
+    "short_ttl_data",
+    loader=lambda: fast_query(),
+    degraded_value="loading",
+    ttl=60,  # 60秒 TTL，续期时也会继承此 TTL
+    rebuild_strategy=RebuildStrategy.ASYNC,
+)
+```
+
+### 降级值持久化
+
+```python
+# 首次请求传入降级值
+result1 = guard.get(
+    "failing_key",
+    loader=lambda: failing_query(),  # 抛出异常
+    degraded_value="safe_fallback",
+)
+print(result1)  # "safe_fallback"
+
+# 后续请求即使不传入 degraded_value 也能获得降级保护
+result2 = guard.get("failing_key")
+print(result2)  # "safe_fallback"
+
+# 超时场景同样会持久化降级值
+guard2 = CacheAvalancheGuard(rebuild_timeout_seconds=0.1)
+result3 = guard2.get(
+    "slow_key",
+    loader=lambda: slow_query(seconds=10),  # 超时
+    degraded_value="timeout_fallback",
+)
+print(result3)  # "timeout_fallback"
+
+# 后续请求无需传入 degraded_value
+result4 = guard2.get("slow_key")
+print(result4)  # "timeout_fallback"
+```
+
+### 自定义 TTL 续期
+
+```python
+# 短 TTL 条目，续期时保持短 TTL
+guard.set("volatile_data", "value", ttl=10)  # 10秒 TTL
+
+# 访问多次成为热点键
+for _ in range(15):
+    guard.get("volatile_data")
+
+# 后台续期时会继承 10 秒 TTL，而非使用默认 300 秒
+entry = guard.get_entry("volatile_data")
+print(entry.original_ttl)  # 10
+
+# 长 TTL 条目
+guard.set("permanent_data", "value", ttl=3600)  # 1小时 TTL
+for _ in range(15):
+    guard.get("permanent_data")
+
+entry2 = guard.get_entry("permanent_data")
+print(entry2.original_ttl)  # 3600
 ```
 
 ### 按标签批量失效

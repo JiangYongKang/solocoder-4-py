@@ -20,6 +20,7 @@
 - **handler 超时中断**：使用 `ThreadPoolExecutor + Future.result(timeout)` 实现超时保护，避免卡死调度
 - **周期追赶补偿**：`resume(catch_up=True)` 逐周期补跑暂停期间遗漏的调度，追平后自动复位
 - **触发器竞态防护**：执行前锁内终态二次校验，窗口期 cancel/unregister 一律记录为 SKIPPED 而非误执行
+- **动态 handler 替换**：通过 `set_task_handler(task_id, handler)` 线程安全地替换任务执行逻辑
 
 ## 任务类型
 
@@ -144,6 +145,155 @@ last = runner.get_latest_run("task_id")
 # 按 run_id 精确查找
 record = runner.get_run_by_id("task_id", "run-uuid")
 ```
+
+## Handler 超时机制
+
+长时间阻塞的 handler 会阻塞整个 `tick()` 调度，导致其他任务无法执行。
+通过在 `TaskDefinition` 中设置 `timeout_seconds`，可以让运行器在超时后立即
+判定为失败，并继续执行其他任务。
+
+**实现原理**：
+- 当 `timeout_seconds` 为正数时，handler 通过内部 `ThreadPoolExecutor.submit()`
+  提交执行，然后调用 `future.result(timeout=timeout_seconds)` 等待结果。
+- 一旦抛出 `concurrent.futures.TimeoutError`，会立即调用 `future.cancel()`
+  并向运行记录写入 `error_type = "TimeoutError"`，`status = FAILED`。
+- 当 `timeout_seconds` 为 `None` 或 `<= 0` 时，走直接同步调用路径（无额外线程开销）。
+
+**注意事项**：Python 标准线程**无法被强制 kill**。因此超时后虽然运行器会立即
+返回，但被提交到线程池的 handler 线程可能仍在后台运行直到其自行结束。
+建议在 handler 中自行实现可中断逻辑（例如检查 `Event` 标志位），或设置
+足够宽裕的超时避免真实的资源泄漏。
+
+```python
+runner.register(TaskDefinition(
+    task_id="risky_io",
+    task_type=TaskType.MANUAL,
+    handler=risky_network_call,
+    timeout_seconds=5.0,   # 超过 5s 即判定失败
+    max_retries=1,
+))
+runner.activate("risky_io")
+rec = runner.trigger("risky_io")
+if rec.is_failed and rec.error_type == "TimeoutError":
+    print("网络调用超时，已跳过")
+```
+
+## 重试延迟策略
+
+`max_retries` 控制失败自动重试次数，但如果没有间隔，瞬时故障也可能在微秒级
+耗尽所有重试，既浪费资源也不利于故障自愈。配合 `retry_delay_seconds`
+可以在每次重试前插入一个固定延迟（首次执行不延迟）。
+
+**使用示例**：
+
+```python
+runner.register(TaskDefinition(
+    task_id="flaky_api",
+    task_type=TaskType.MANUAL,
+    handler=call_flaky_api,
+    max_retries=3,            # 最多重试 3 次（共 4 次尝试）
+    retry_delay_seconds=1.5,  # 每次重试前等待 1.5s
+))
+```
+
+- `attempt == 1`：立即执行，不睡眠
+- `attempt > 1`：如果 `retry_delay_seconds > 0`，调用 `_sleep(retry_delay_seconds)`
+
+**测试友好**：`_sleep` 通过可注入的 `sleep_provider` 执行，测试时可以传入
+no-op 或计数器，避免真实等待：
+
+```python
+sleeps: List[float] = []
+runner = InternalTaskRunner(sleep_provider=lambda s: sleeps.append(s))
+# ... 触发重试后，sleeps 会记录所有延迟值
+assert sleeps == [1.5, 1.5, 1.5]   # 3 次重试，3 次延迟
+```
+
+## 周期任务追赶补偿（catch-up）
+
+对 `PERIODIC` 任务调用 `pause()` 后，如果暂停期间跨越了多个调度周期，
+默认 `resume()` 会直接把 `next_run_at` 跳到 `now + interval`，丢弃所有
+暂停期间应执行的周期。这对**心跳、最新状态快照**等只关心"最新值"的任务是正确的，
+但对**每日结算、增量数据同步**等不可遗漏的场景就会出错。
+
+### 两种恢复策略对比
+
+```python
+# 策略 1（默认）：丢弃暂停期间周期，从 now + interval 开始
+runner.resume("heartbeat", catch_up=False)
+# next_run_at = now + interval，中间错过的周期全部跳过
+
+# 策略 2：逐周期补跑，直到追平当前时间
+runner.resume("daily_settlement", catch_up=True)
+# 保留原 next_run_at，每次 tick() 补跑一个周期
+```
+
+**追赶执行过程**（假设 `interval=10s`，暂停了 105s，错过 10 个周期）：
+
+| tick 次数 | 补跑调度点 | 结果 |
+|-----------|-----------|------|
+| 1 | t=20 | 执行，next_run_at += 10 → 30 |
+| 2 | t=30 | 执行，next_run_at += 10 → 40 |
+| ... | ... | ... |
+| 10 | t=110 | 执行，next_run_at += 10 → 120 |
+| 11 | — | 120 > now=115，`catch_up` 标志自动关闭，不再执行 |
+
+- **避免一次 tick 爆发式运行**：追赶模式下，每个 tick 最多只补跑 1 个周期，
+  下一个周期留给后续 tick，避免单线程阻塞时间过长。
+- **追平自动关闭**：当 `next_run_at > now` 时，`catch_up` 自动设为 `False`，
+  之后调度恢复默认的"跳跃"行为（即如果仍落后则跳到 `now + interval`）。
+
+## 触发器竞态防护
+
+### 问题背景
+
+`trigger()` 原本的流程是：
+
+```
+持锁 → 校验状态（非终态）→ 放锁 → 执行 handler
+```
+
+在"放锁 → 执行 handler"的窗口期内，另一个线程完全可能调用 `cancel()`
+或 `unregister()`，导致 handler 仍然被执行，但任务状态已经是终态，
+产生矛盾的运行记录。
+
+### 修复方案
+
+将**终态二次校验**与**definition 快照**封装在 `_execute_single_run` 入口处的
+**同一个锁保护范围**内，从而消除竞态窗口：
+
+```
+_execute_single_run 入口：
+  持锁：
+    1. 再次查找任务 → 不存在：返回 SKIPPED（"任务已被注销"）
+    2. 检查 status → 终态：写入 SKIPPED 记录并返回
+    3. 快照 definition_snapshot（确保本次执行使用同一份 handler/超时/重试配置）
+  放锁：
+    循环执行 handler（使用快照），不再访问共享可变状态
+  持锁：
+    提交记录到历史
+```
+
+窗口期被 cancel/unregister 的结果是产生一条 `SKIPPED` 记录，`skip_count += 1`，
+handler 不会被调用，统计数据仍然一致。
+
+### definition_snapshot 的一致性意义
+
+除了终态防护，**快照**还解决了"handler 动态替换期间的不一致"问题：
+如果在 handler 执行过程中（另一个线程）替换了 `info.definition.handler`，
+本次运行仍然使用入口处读取的 `definition_snapshot`，避免中途切换逻辑。
+
+测试代码可以通过下面模式验证：
+
+```python
+# 在 handler 阻塞期间替换
+info = runner.get_task("mid")
+info.definition.handler = lambda **kw: "injected"
+# 但运行结果仍然是阻塞 handler 的返回值
+assert result.result == "blocking-result"
+```
+
+---
 
 ## 测试中模拟时间（无需真实等待）
 

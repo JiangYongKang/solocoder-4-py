@@ -1,4 +1,3 @@
-from collections import deque
 import heapq
 from typing import Dict, List
 

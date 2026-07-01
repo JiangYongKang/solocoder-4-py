@@ -1,0 +1,6 @@
+你实现的缓存雪崩防护功能模块存在以下问题，需要修复：
+1. README.md 第 37 行描述热点键续期机制时使用了"当剩余 TTL 低于默认 TTL 的 30% 时自动续期"，但实际代码中的续期阈值已基于条目自身的 original_ttl 计算而非全局默认值。需要将此处描述改为"条目自身 TTL 的 30%"以与代码行为一致。
+2. README.md 缺少异步重建策略（ASYNC）的专门说明和使用示例。ASYNC 策略的行为（立即返回降级值、后台线程执行重建）与 SYNC 策略有显著差异。需要新增 ASYNC 策略说明章节并附带代码示例。
+3. README.md 未说明超时降级持久化机制：_rebuild_cache 在非重建方等待超时路径中已将降级值自动写入缓存并标记为 DEGRADED 状态，后续请求无需再次传入 degraded_value 即可获得降级保护。需要在降级行为章节中补充这一逻辑说明。
+4. test_renew_hot_key_default_ttl_fallback 测试使用了默认 jitter_ratio（0.1），续期后的 expires_at 断言使用 time.time() 实时时间戳作为基准，而 _apply_jitter 的抖动可能使实际过期时间偏离预期范围，存在间歇性失败风险。需要显式设置 jitter_ratio=0 以消除不确定性，与同类测试 test_renew_hot_key_uses_entry_ttl 保持一致。
+5. 重新运行 poetry run pytest tests/cache_avalanche_guard/ -q，需要让所有测试通过。

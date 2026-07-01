@@ -1155,6 +1155,7 @@ class TestCustomTTLRenewal:
     def test_renew_hot_key_default_ttl_fallback(self):
         guard = CacheAvalancheGuard(
             default_ttl=300,
+            jitter_ratio=0,
             hot_key_threshold=3,
             hot_key_window_seconds=60,
             enable_background_renew=False,
@@ -1172,14 +1173,18 @@ class TestCustomTTLRenewal:
             guard.get("no_original_ttl")
 
         original_expires_at = entry.expires_at
+
+        time.sleep(9)
+
+        now_before = time.time()
         guard._renew_hot_key("no_original_ttl", entry)
 
         entry_after = guard.get_entry("no_original_ttl")
         assert entry_after is not None
         assert entry_after.expires_at > original_expires_at
 
-        expected_min = time.time() + 300 * 0.5
-        expected_max = time.time() + 300 * 1.5
+        expected_min = now_before + 300 - 1
+        expected_max = now_before + 300 + 1
         assert expected_min <= entry_after.expires_at <= expected_max
 
 

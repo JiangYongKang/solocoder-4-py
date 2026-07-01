@@ -294,11 +294,11 @@ else:
 
 | 方法 | 说明 |
 |------|------|
-| `get(key, loader=None, tags=None, ttl=None, local_ttl=None, shared_ttl=None)` | 分层读穿透获取 |
-| `get_or_load(key, loader, tags=None, **kwargs)` | 强制带 loader 的 get |
-| `get_local(key)` | 仅查 L1 |
-| `get_shared(key)` | 仅查 L2 |
-| `get_with_level(key)` | 获取值并返回命中层级 |
+| `get(key, loader=None, tags=None, ttl=None, local_ttl=None, shared_ttl=None) -> Optional[T]` | 分层读穿透获取，返回 `Optional[T]` |
+| `get_or_load(key, loader, tags=None, **kwargs) -> Optional[T]` | 强制带 loader 的 get，返回 `Optional[T]`（loader 返回 None 时不缓存） |
+| `get_local(key) -> Optional[Any]` | 仅查 L1 |
+| `get_shared(key) -> Optional[Any]` | 仅查 L2 |
+| `get_with_level(key, loader=None, tags=None, ttl=None, local_ttl=None, shared_ttl=None) -> Tuple[Optional[T], Optional[CacheLevel]]` | 获取值并返回命中层级，支持完整的读穿透能力 |
 | `set(key, value, tags=None, ttl=None, local_ttl=None, shared_ttl=None, write_local=True, write_shared=True)` | 主动写入缓存 |
 | `set_local(key, value, tags=None, ttl=None)` | 仅写入 L1 |
 | `set_shared(key, value, tags=None, ttl=None)` | 仅写入 L2 |

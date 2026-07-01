@@ -335,7 +335,8 @@ class WarmupOrchestrator:
 
         if strategy == FailureStrategy.SKIP_DEPENDENTS:
             with ctx._ctx_lock:
-                downstream = TopologySorter.get_all_downstream(ctx.tasks, failed_task_id)
+                tasks_snapshot = dict(ctx.tasks)
+            downstream = TopologySorter.get_all_downstream(tasks_snapshot, failed_task_id)
             for ds_id in downstream:
                 if ds_id not in skip_set and ds_id not in fail_set:
                     skip_set.add(ds_id)

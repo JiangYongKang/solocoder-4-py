@@ -832,3 +832,194 @@ class TestRequestSnapshotCache:
         stats = cache.get_stats()
         assert stats["version_race_detected"] == 2
         assert stats["sets"] == 0
+
+    def test_per_entry_ttl_overrides_default(self):
+        cache = RequestSnapshotCache(default_ttl=100)
+        params = {"id": 1}
+
+        cache.set(params, "value", ttl=0.1)
+
+        entry = cache.get_entry(params)
+        assert entry.ttl == 0.1
+
+        assert cache.get(params) == "value"
+
+        time.sleep(0.15)
+
+        assert cache.get(params) is None
+
+        stats = cache.get_stats()
+        assert stats["ttl_cleanups"] >= 1
+
+    def test_per_entry_ttl_without_default(self):
+        cache = RequestSnapshotCache(default_ttl=None)
+
+        cache.set({"id": 1}, "permanent", ttl=None)
+        cache.set({"id": 2}, "short_lived", ttl=0.1)
+
+        entry1 = cache.get_entry({"id": 1})
+        entry2 = cache.get_entry({"id": 2})
+        assert entry1.ttl is None
+        assert entry2.ttl == 0.1
+
+        time.sleep(0.15)
+
+        assert cache.get({"id": 1}) == "permanent"
+        assert cache.get({"id": 2}) is None
+
+    def test_per_entry_ttl_different_values(self):
+        cache = RequestSnapshotCache(default_ttl=None)
+
+        cache.set({"id": 1}, "v1", ttl=0.05)
+        cache.set({"id": 2}, "v2", ttl=0.2)
+        cache.set({"id": 3}, "v3", ttl=None)
+
+        time.sleep(0.1)
+
+        assert cache.get({"id": 1}) is None
+        assert cache.get({"id": 2}) == "v2"
+        assert cache.get({"id": 3}) == "v3"
+
+        time.sleep(0.15)
+
+        assert cache.get({"id": 2}) is None
+        assert cache.get({"id": 3}) == "v3"
+
+    def test_per_entry_ttl_cleanup_on_has(self):
+        cache = RequestSnapshotCache(default_ttl=None)
+
+        cache.set({"k": "a"}, "v", ttl=0.1)
+        assert cache.has({"k": "a"}) is True
+
+        time.sleep(0.15)
+
+        assert cache.has({"k": "a"}) is False
+        assert len(cache) == 0
+
+    def test_per_entry_ttl_cleanup_on_len(self):
+        cache = RequestSnapshotCache(default_ttl=None)
+
+        cache.set({"k1": 1}, "v1", ttl=0.1)
+        cache.set({"k2": 2}, "v2", ttl=100)
+        cache.set({"k3": 3}, "v3", ttl=None)
+
+        assert len(cache) == 3
+
+        time.sleep(0.15)
+
+        assert len(cache) == 2
+
+    def test_per_entry_ttl_effective_ttl_precedence(self):
+        cache = RequestSnapshotCache(default_ttl=10)
+
+        cache.set({"id": 1}, "v1")
+        cache.set({"id": 2}, "v2", ttl=0.1)
+        cache.set({"id": 3}, "v3", ttl=20)
+
+        entry1 = cache.get_entry({"id": 1})
+        entry2 = cache.get_entry({"id": 2})
+        entry3 = cache.get_entry({"id": 3})
+        assert entry1.ttl is None
+        assert entry2.ttl == 0.1
+        assert entry3.ttl == 20
+
+        time.sleep(0.15)
+
+        assert cache.get({"id": 1}) == "v1"
+        assert cache.get({"id": 2}) is None
+        assert cache.get({"id": 3}) == "v3"
+
+    def test_has_evicts_on_version_mismatch(self):
+        cache = RequestSnapshotCache()
+
+        cache.set({"id": 1}, "value", data_entities=["users"])
+        assert cache.has({"id": 1}, data_entities=["users"]) is True
+        assert len(cache) == 1
+
+        cache.bump_entity_version("users")
+
+        assert cache.has({"id": 1}, data_entities=["users"]) is False
+        assert len(cache) == 0
+
+    def test_has_version_mismatch_clears_dependencies(self):
+        cache = RequestSnapshotCache()
+
+        cache.set({"id": 1}, "value", data_entities=["users", "orders"])
+        assert len(cache) == 1
+
+        cache.bump_entity_version("users")
+
+        result = cache.has({"id": 1}, data_entities=["users", "orders"])
+        assert result is False
+
+        assert len(cache) == 0
+
+        stats = cache.get_stats()
+        assert stats["size"] == 0
+        assert stats["vm_cache_count"] == 0
+
+    def test_contains_operator_evicts_on_version_mismatch(self):
+        cache = RequestSnapshotCache()
+
+        cache.set({"id": 1}, "value", data_entities=["users"])
+        assert {"id": 1} in cache
+        assert len(cache) == 1
+
+        cache.bump_entity_version("users")
+
+        assert {"id": 1} not in cache
+        assert len(cache) == 0
+
+    def test_has_no_evict_when_version_valid(self):
+        cache = RequestSnapshotCache()
+
+        cache.set({"id": 1}, "value", data_entities=["users"])
+        assert cache.has({"id": 1}, data_entities=["users"]) is True
+        assert len(cache) == 1
+
+        assert cache.has({"id": 1}, data_entities=["users"]) is True
+        assert len(cache) == 1
+
+    def test_get_no_redundant_ttl_check(self):
+        cache = RequestSnapshotCache(default_ttl=10)
+
+        cache.set({"id": 1}, "value")
+        entry = cache.get_entry({"id": 1})
+        assert entry is not None
+
+        original_created_at = entry.created_at
+
+        entry.created_at = original_created_at - 100
+
+        result = cache.get({"id": 1})
+
+        assert result is None
+
+        stats = cache.get_stats()
+        assert stats["misses"] == 1
+        assert stats["ttl_cleanups"] >= 1
+
+    def test_per_entry_ttl_zero_is_invalid(self):
+        cache = RequestSnapshotCache(default_ttl=None)
+
+        cache.set({"id": 1}, "expire_immediately", ttl=0)
+
+        time.sleep(0.01)
+
+        assert cache.get({"id": 1}) is None
+
+    def test_per_entry_ttl_cleanup_on_get_stats(self):
+        cache = RequestSnapshotCache(default_ttl=None)
+
+        cache.set({"a": 1}, "v1", ttl=0.1)
+        cache.set({"a": 2}, "v2", ttl=0.1)
+        cache.set({"a": 3}, "v3", ttl=100)
+
+        stats_before = cache.get_stats()
+        assert stats_before["size"] == 3
+
+        time.sleep(0.15)
+
+        stats_after = cache.get_stats()
+        assert stats_after["size"] == 1
+        assert stats_after["ttl_cleanups"] >= 2
