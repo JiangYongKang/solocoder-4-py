@@ -1,43 +1,5 @@
 产物不满意：
 无
 
-分析说明：
-
-1. "始终遍历但快速跳过" vs "预检查提前返回"：
-   - 原始预检查 any(...) 本身就要做一次全量遍历（当没有任何 per-entry TTL 时 any() 必须遍历完所有条目才能返回 False），因此原逻辑在无 TTL 场景下同样是 O(n) 扫描成本，并非真正"提前"避免遍历。
-   - 修改后的单次遍历在无 TTL 时 per-entry 操作略重（effective_ttl 赋值 + 两个条件判断），但差异为常数级，在 Python 层面几乎不可测量。
-   - 在有 TTL 配置的场景（default_ttl 已设置 或 存在 per-entry TTL），修改后严格从 O(2n) 降为 O(n)，是实质性的性能改进。
-   - 因此修改后的方案正确且更优。
-
-2. 逻辑等价性验证（覆盖所有边界）：
-   - default_ttl=None 且所有条目 ttl=None：原 any()→False→return 0；新 effective_ttl=None→跳过→return 0。等价。
-   - default_ttl=None 且部分条目有 per-entry TTL：原 any()→True→主循环；新 effective_ttl 逐条目计算。等价。
-   - default_ttl=10 且条目 ttl=None：原跳过预检查→主循环；新 effective_ttl=10。等价。
-   - default_ttl=10 且条目 ttl=5：新 effective_ttl=5（per-entry 优先）。等价。
-   - ttl=0 零值 TTL：新 effective_ttl=0→now-created_at>0 为真→正常清理。与 test_per_entry_ttl_zero_is_invalid 预期一致。
-   - 缓存为空时：新循环不执行→expired_keys=[]→return 0。等价。
-   - ttl 优先级（per-entry 覆盖 default）在所有场景下保持一致。
-   无边界情况遗漏。
-
-3. 是否引入新问题：
-   - 修改不涉及线程安全变化（_cleanup_expired 始终在 with self._lock 上下文中调用）。
-   - 不改变 ttl 清理的状态计数逻辑（ttl_cleanups 统计方式不变）。
-   - 不改变 evict_internal 的调用方式。
-   - 测试套件 122 个测试全部通过，覆盖了无 TTL、default TTL、per-entry TTL、混合 TTL、TTL=0、各种 lazy cleanup 触发点。
-   无新问题引入。
-
 过程不满意：
 无
-
-分析说明：
-
-1. 过程效率：模型以 3 步实质性操作（读取文件→精确编辑→运行测试）完成修复，无冗余操作，步骤紧凑。符合 prompt 要求的"简洁高效"标准。
-
-2. 一致性验证：模型通过运行 poetry run pytest tests/request_snapshot_cache/ -q（122 passed）验证了修改的正确性。测试套件对 TTL 行为的覆盖充分：
-   - test_no_ttl_no_cleanup_triggered（无 TTL 时确认 ttl_cleanups==0）
-   - test_ttl_none_means_no_expiration（default_ttl=None 永不过期）
-   - test_ttl_expiration + 5 个 lazy cleanup 测试（default_ttl=0.1 超时清理）
-   - test_per_entry_ttl_overrides_default / test_per_entry_ttl_without_default / test_per_entry_ttl_different_values / test_per_entry_ttl_effective_ttl_precedence（per-entry TTL 各种场景）
-   - test_per_entry_ttl_zero_is_invalid（ttl=0 边界）
-   - test_ttl_cleanup_preserves_valid_entries（有效条目不被误清理）
-   这些测试覆盖了修改前后行为等价性所需的所有关键场景，122 全部通过充分证明了修复的正确性，无需额外人工验证。

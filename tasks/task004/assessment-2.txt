@@ -1,9 +1,9 @@
 产物不满意：
-1. README.md 第 37 行描述热点键续期机制时仍写为"当剩余 TTL 低于默认 TTL 的 30% 时自动续期"，但修复后阈值已改为条目自身的 original_ttl。触发节点为 README.md 第 37 行。业务影响是读者参考文档将获得错误的续期阈值计算规则。根本原因是文档描述未随代码同步更新。解决方案是将此处改为"条目自身 TTL 的 30%"。
-2. README.md 未添加异步重建策略（ASYNC）的专门说明和使用示例。触发节点为 README.md 全文。业务影响是用户无法通过文档了解 SYNC 与 ASYNC 两种策略的行为差异（ASYNC 立即返回降级值、后台线程执行重建），也不知道何时应使用异步重建。根本原因是修复代码逻辑后未在文档中补充对应章节。解决方案是新增 ASYNC 策略说明章节并附带代码示例。
-3. README.md 未说明超时降级持久化机制：修复后 _rebuild_cache 在非重建方等待超时路径中实现了降级值自动写入缓存并标记为 DEGRADED 状态，但文档中"降级行为"部分未提及此变更。触发节点为 README.md 的降级行为章节。业务影响是用户不知道后续请求无需再次传入 degraded_value 即可获得降级保护。根本原因是修复后未同步更新文档。解决方案是在降级行为章节中补充超时场景下的持久化逻辑说明。
-4. test_renew_hot_key_default_ttl_fallback 测试使用了默认 jitter_ratio（0.1），续期后的 expires_at 断言使用 time.time() 实时获取时间戳作为基准，但 _apply_jitter 的抖动可能使实际过期时间偏离预期范围。触发节点为 test_cache_entry.py 约第 1155-1183 行。业务影响是该测试存在间歇性失败风险。根本原因是未设置 jitter_ratio=0 以消除不确定性，与同类测试 test_renew_hot_key_uses_entry_ttl 的处理方式不一致。解决方案是显式设置 jitter_ratio=0。
+1. README.md 描述热点键续期机制时仍写为当剩余 TTL 低于默认 TTL 的 30% 时自动续期，但修复后阈值已改为条目自身的 original_ttl。读者参考文档将获得错误的续期阈值计算规则。根本原因是文档描述未随代码同步更新。
+2. README.md 未添加异步重建策略（ASYNC）的专门说明和使用示例。用户无法通过文档了解 SYNC 与 ASYNC 两种策略的行为差异（ASYNC 立即返回降级值、后台线程执行重建），也不知道何时应使用异步重建。根本原因是修复代码逻辑后未在文档中补充对应章节。
+3. README.md 未说明超时降级持久化机制：修复后 _rebuild_cache 在非重建方等待超时路径中实现了降级值自动写入缓存并标记为 DEGRADED 状态，但文档中降级行为部分未提及此变更。用户不知道后续请求无需再次传入 degraded_value 即可获得降级保护。根本原因是修复后未同步更新文档。
+4. test_renew_hot_key_default_ttl_fallback 测试使用了默认 jitter_ratio，续期后的 expires_at 断言使用 time.time() 实时获取时间戳作为基准，但 jitter 的抖动可能使实际过期时间偏离预期范围。该测试存在间歇性失败风险。根本原因是未设置 jitter_ratio=0 以消除不确定性，与同类测试的处理方式不一致。
 
 过程不满意：
-1. 首轮代码修改与测试编写完成后，运行测试发现 3 个失败用例，需经历两轮调试修复才全部通过。触发节点为 session-cot-2 中首次 pytest 运行结果。实际行为是 TestShortTTLRenewalThreshold 的 test_find_hot_keys_uses_entry_ttl_not_default 初始版本未正确设置条目的 remaining_ttl；两个续期测试的 expires_at 断言对 jitter 抖动范围估计不足。根本原因是初次编码时对 jitter 影响和测试数据构造的考虑不够充分。解决方案是在编写涉及 jitter 的测试前先手动计算抖动边界范围，设定 jitter_ratio=0 以消除不确定性。
-2. test_timeout_degraded_value_has_independent_ttl 测试初始版本存在逻辑缺陷：waiter 线程直接调用 get() 不带 loader 和 degraded_value，导致在重建超时后因未传入 degraded_value 而返回 None，后续断言无法通过。触发节点为 session-cot-2 中对该测试的修改记录。实际行为是需改写测试逻辑后才通过。根本原因是编写多线程测试时对各路径返回值的前置条件分析不够仔细。解决方案是编写多线程测试时先画出线程间交互的时序图以理清每个线程能达到的代码路径。
+1. 首轮代码修改与测试编写完成后，运行测试发现多个失败用例，需经历两轮调试修复才全部通过。TestShortTTLRenewalThreshold 的测试初始版本未正确设置条目的 remaining_ttl；续期测试的 expires_at 断言对 jitter 抖动范围估计不足。根本原因是初次编码时对 jitter 影响和测试数据构造的考虑不够充分。应在编写涉及 jitter 的测试前先手动计算抖动边界范围，设定 jitter_ratio=0 以消除不确定性。
+2. test_timeout_degraded_value_has_independent_ttl 测试初始版本存在逻辑缺陷：waiter 线程直接调用 get 不带 loader 和 degraded_value，导致在重建超时后因未传入 degraded_value 而返回 None，后续断言无法通过。需要改写测试逻辑后才通过。根本原因是编写多线程测试时对各路径返回值的前置条件分析不够仔细。

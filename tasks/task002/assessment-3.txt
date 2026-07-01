@@ -1,9 +1,7 @@
 产物不满意：
-1. LayeredCache.set_local 和 set_shared 方法的 ttl 参数默认值未适配 _UNSET sentinel 模式。触发节点为 layered_cache.py 第662行的 set_local 和第672行的 set_shared，其 ttl 默认值仍为 `None`，而 get、set、get_with_level 已统一改为 `_UNSET`。实际行为是调用 `cache.set_local("k", "v")` 不传 ttl 时，`None` 传给 SingleLevelCache.set，由于 `None is not _UNSET`，被判定为永不过期，而非使用 default_ttl（默认300秒）。业务影响是所有未显式指定 ttl 的 set_local 和 set_shared 调用将条目错误设为永不过期，可能导致内存持续增长且与模块其他 API 语义不一致。根本原因是模型在批量迁移 ttl 默认值时遗漏了这两个辅助方法。解决方案是将其 ttl 默认值也改为 `_UNSET` 并在调用前做 sentinel 判断。
-
-2. get 与 get_with_level 中的 TTL 解析和回填逻辑仍然完全重复，本轮未解决此技术债务。触发节点为 layered_cache.py 的 get 方法（第380-453行）和 get_with_level 方法（第515-588行），两处各约40行近乎相同的代码：共享命中时的 effective_local_ttl 多级优先级判断、loader 回填时的 effective_shared_ttl/effective_local_ttl 双层六路解析、以及 _UNSET 分支的 if/else set 调用。实际行为是模型通过 replace_all 同时修改两处但未趁此机会抽取私有方法。业务影响是随着 TTL 规则持续演进，维护双副本增加修改成本和遗漏风险。根因是 assessment-2.txt 已明确建议抽取 `_backfill_from_shared`，模型在第3轮修复中忽略了该建议。解决方案是抽取 `_resolve_backfill_ttl` 等私有方法使两处共享同一段逻辑。
+1. layered_cache.py 的 set_local 和 set_shared 方法的 ttl 参数默认值未适配 _UNSET sentinel 模式。其 ttl 默认值仍为 None，而 get、set、get_with_level 已统一改为 _UNSET。调用时不传 ttl 时 None 传给 SingleLevelCache.set，被判定为永不过期而非使用 default_ttl（默认300秒），导致所有未显式指定 ttl 的调用将条目错误设为永不过期，可能导致内存持续增长且与模块其他 API 语义不一致。根本原因是模型在批量迁移 ttl 默认值时遗漏了这两个辅助方法。
+2. layered_cache.py 的 get 与 get_with_level 中的 TTL 解析和回填逻辑仍然完全重复，本轮未解决此技术债务。两处各约40行近乎相同的代码：共享命中时的 effective_local_ttl 多级优先级判断、loader 回填时的双层六路解析、以及 _UNSET 分支的 if/else set 调用。模型通过 replace_all 同时修改两处但未趁此机会抽取私有方法。随着 TTL 规则持续演进，维护双副本增加修改成本和遗漏风险。
 
 过程不满意：
-1. 模型修改 SingleLevelCache.set 引入 _UNSET sentinel 后首次运行测试即出现 test_invalidate_expired 失败。具体环节是 session-cot-3 中改完 SingleLevelCache.set 后执行 pytest，一个测试因 LayeredCache.set 的 ttl 默认值仍为 None 而失败——None 被新语义解释为永不过期。具体行为是模型不得不回头修改 LayeredCache.set 的参数签名和 _UNSET 条件分支，形成「修改→测试失败→回修→再测试」的试错循环。导致后果是降低修复效率且暴露了全局影响分析不足。应该做的事是在修改 SingleLevelCache.set 之前先全局搜索所有调用方（get、get_with_level、set、set_local、set_shared），预判 None 在参数传递链上的语义变化，一次性完成所有方法的适配。
-
-2. 模型在第2轮标注已建议抽取公共方法的情况下，第3轮仍选择复制粘贴式修改。具体环节是 session-cot-3 中对 get 和 get_with_level 的共享命中回填和 loader 回填逻辑的修改。具体行为是使用 replace_all 同时对两处做相同的 _UNSET sentinel 优先级判断和条件 set 调用替换，但未趁此最佳重构时机抽取私有方法。导致后果是原本约15行的重复代码在此轮膨胀为约40行（因 _UNSET 条件分支引入），技术债务被进一步加重。应该做的事是既然本轮需对两处做相同修改，应当将 TTL 优先级解析和 _UNSET 分支 set 调用抽取为1-2个私有方法，从根本上消除维护双副本的风险。
+1. 模型修改 SingleLevelCache.set 引入 _UNSET sentinel 后首次运行测试即出现失败。原因是 LayeredCache.set 的 ttl 默认值仍为 None，None 被新语义解释为永不过期。模型不得不回头修改 LayeredCache.set 的参数签名和 _UNSET 条件分支，形成修改到测试失败到回修到再测试的试错循环。应在修改 SingleLevelCache.set 之前先全局搜索所有调用方，预判 None 在参数传递链上的语义变化，一次性完成所有方法的适配。
+2. 模型在第2轮标注已建议抽取公共方法的情况下，第3轮仍选择复制粘贴式修改。对 get 和 get_with_level 的共享命中回填和 loader 回填逻辑使用 replace_all 同时对两处做相同的 _UNSET sentinel 优先级判断和条件 set 调用替换，但未趁此最佳重构时机抽取私有方法。导致原本约15行的重复代码膨胀为约40行（因 _UNSET 条件分支引入），技术债务被进一步加重。

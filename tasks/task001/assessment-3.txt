@@ -1,9 +1,7 @@
 产物不满意：
-1. `_execute_abort_with_retry`（coordinator.py 第 541 行）用 `except Exception: pass` 吞异常，注释"abort_transaction 自身不抛异常"与代码矛盾——第 390、400 行均抛 `TransactionStateError`。触发于超时分支。宽泛捕获成隐蔽陷阱，误用致静默失败。根因是未核验被调方法异常契约。应改为 `except TransactionStateError`。
-
-2. `commit_transaction` 第 283 行用 `ctx.errors[-len(ctx.commit_failed_participants):]` 切片取末尾拼异常消息，假设 commit 错误在末尾，但 prepare 阶段第 183 行已写入条目，若 prepare 有错误则混入无关信息。触发于部分参与者 commit 失败时。异常消息不可靠。根因是依赖全局 errors 隐式排序。应让 `_do_commit_participants` 用局部列表收集本轮错误。
+1. coordinator.py 的 _execute_abort_with_retry 方法用 `except Exception: pass` 吞异常，注释"abort_transaction 自身不抛异常"与代码矛盾——abort_transaction 多处均抛 TransactionStateError。宽泛捕获成隐蔽陷阱，误用致静默失败。根因是未核验被调方法异常契约，应改为仅捕获 TransactionStateError。
+2. coordinator.py 的 commit_transaction 方法用 ctx.errors 切片取末尾拼异常消息，假设 commit 错误在末尾，但 prepare 阶段已写入条目，若 prepare 有错误则混入无关信息，异常消息不可靠。根因是依赖全局 errors 隐式排序，应让 _do_commit_participants 用局部列表收集本轮错误。
 
 过程不满意：
-1. 模型经历三轮测试-修复循环（5→1→全部通过），与 Round 2 的"补丁式打法"一致。触发于 session-cot-3 三次 pytest（第 451、845、1029 行）。第一轮失败后分析仅停在"测试期望变化"层面，未审视新语义是否引入不一致，导致第二轮仍有异常消息问题。应暂停编码，先绘制完整行为矩阵再批量修正。
-
-2. 模型写 `_execute_abort_with_retry` 前未读 `abort_transaction` 完整实现核实异常契约，直接写 `except Exception` 并注释"自身不抛异常"。触发于 session-cot-3 第 307 行，仅读了 `execute_transaction` 局部视图未验证 `abort_transaction` 第 390-403 行 throw 语句。后果是错误注释与代码矛盾。应写防御代码前完整走读被调方法每个异常分支。
+1. 模型经历三轮测试-修复循环，与之前的补丁式打法一致。第一轮失败后分析仅停在测试期望变化层面，未审视新语义是否引入不一致，导致第二轮仍有异常消息问题。应暂停编码，先绘制完整行为矩阵再批量修正。
+2. 模型写 _execute_abort_with_retry 前未读 abort_transaction 完整实现核实异常契约，直接写 `except Exception` 并注释"自身不抛异常"。后果是错误注释与代码矛盾。应写防御代码前完整走读被调方法每个异常分支。

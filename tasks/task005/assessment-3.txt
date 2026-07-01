@@ -1,9 +1,7 @@
 产物不满意：
-1. _cleanup_expired 方法的 any() 预检查引入了不必要的 O(n) 遍历开销。触发节点为 snapshot_cache.py 第 52-55 行的 `any(entry.ttl is not None for entry in self._cache.values())`。当 `default_ttl=None` 且没有任何条目设置 per-entry TTL 时（最常见的无 TTL 场景），该 any() 仍需完整遍历所有缓存条目才能确认无条件清理，造成一次无意义的 O(n) 全量扫描。更严重的是，当 `default_ttl` 不为 None 或有条目含 per-entry TTL 时，any() 的遍历结束后主循环会再次遍历所有条目做过期判定，形成双重遍历。该冗余预检查在 get、set、has、__len__、__contains__、get_stats、get_entry 等所有公共方法中均被触发，加剧了 assessment-2 中已指出的 TTL 清理性能隐患。解决方案是引入 `_has_per_entry_ttl` 布尔标志位，在 `_set_internal` 写入非 None ttl 时置为 True，_cleanup_expired 据此做 O(1) 决策。
+1. snapshot_cache.py 的 _cleanup_expired 方法的 any() 预检查引入了不必要的 O(n) 遍历开销。当 default_ttl=None 且没有任何条目设置 per-entry TTL 时（最常见的无 TTL 场景），any() 仍需完整遍历所有缓存条目才能确认无条件清理，造成一次无意义的 O(n) 全量扫描。更严重的是当有 TTL 配置时，any() 遍历结束后主循环会再次遍历所有条目做过期判定，形成双重遍历。该冗余预检查在 get、set、has、__len__、__contains__、get_stats 等所有公共方法中均被触发，加剧了已指出的 TTL 清理性能隐患。应引入布尔标志位在 _set_internal 写入非 None ttl 时置为 True，据此做 O(1) 决策。
 
 过程不满意：
-1. 模型使用 Write 工具整体重写 snapshot_cache.py 全文而非精准编辑。触发环节为 session-cot-3 第 42-49 行，模型在阅读源代码后直接调用 Write 工具写入完整的 299 行文件，而非对三个目标修复点分别使用 edit_file_search_replace。实际行为虽最终代码正确（122 测试全通过），但这种做法使代码审查难以辨别哪些行发生了变更、哪些行是原样保留，增加了意外修改无关逻辑的风险。正确做法是将三个修复逐一拆分：对 get 方法用 StrReplace 删除第 95-99 行冗余 TTL 检查，对 _set_internal 用编辑工具追加 ttl 参数传递，对 has 方法追加版本失效驱逐逻辑，每次编辑后运行测试确认无回归。
-
-2. TodoList 初始规划缺少测试验证步骤。触发环节为 session-cot-3 第 3-10 行，模型首次创建的 TodoList 仅有 4 个代码修改项（修复问题 1、2、3 及一个不明项），未包含"运行 pytest 验证全部测试通过"或"检查 linter 错误"等验证步骤。测试执行仅在模型自行决定追加测试代码后才作为被动行为出现，而非事前计划。实际后果是如果某项修复引入了隐秘回归，模型可能完成代码修改即声称修复完成而未做验证。正确做法是将"运行测试验证"和"检查测试覆盖"作为 TodoList 的固定最终项。
-
-3. 模型描述的"补充新增功能测试"用语存在定位偏差。触发环节为 session-cot-3 第 61 行"现在补充新增功能的单元测试"，模型将 per-entry TTL 实现表述为"新增功能"而非"修复验证"。per-entry TTL 的实质是修复 `_set_internal` 方法接受 ttl 参数但从未存储的 BUG，属于缺陷修复而非功能扩展。虽然最终新增的 13 个测试正确覆盖了 per-entry TTL、has 驱逐、以及冗余 TTL 检查删除等修复点，但"新增功能"这种思维方式可能在不被约束的场景下导致模型在修复会话中越界扩展功能，偏离本轮"只能做修复不做新功能扩展"的核心约束。
+1. 模型使用 Write 工具整体重写 snapshot_cache.py 全文而非精准编辑。模型在阅读源代码后直接写入完整的数百行文件，而非对三个目标修复点分别使用 StrReplace。虽然最终代码正确，但这种做法使代码审查难以辨别哪些行发生了变更、哪些行是原样保留，增加了意外修改无关逻辑的风险。应将修复逐一拆分，每次编辑后运行测试确认无回归。
+2. TodoList 初始规划缺少测试验证步骤。模型首次创建的 TodoList 仅有几个代码修改项，未包含运行 pytest 验证全部测试通过或检查 linter 错误等验证步骤。测试执行仅在模型自行决定追加测试代码后才作为被动行为出现。如果某项修复引入了隐秘回归，模型可能完成代码修改即声称修复完成而未做验证。
+3. 模型描述的补充新增功能测试用语存在定位偏差。模型将 per-entry TTL 实现表述为新增功能而非修复验证。per-entry TTL 的实质是修复 _set_internal 方法接受 ttl 参数但从未存储的 BUG，属于缺陷修复而非功能扩展。这种思维方式可能在不被约束的场景下导致模型在修复会话中越界扩展功能。

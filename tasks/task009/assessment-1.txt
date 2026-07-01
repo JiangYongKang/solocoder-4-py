@@ -1,17 +1,10 @@
 产物不满意：
-
-触发节点：`_execute_single_run` 方法。实际行为：`TaskDefinition` 中 `timeout_seconds` 和 `retry_delay_seconds` 字段设而未用，handler 无超时且重试间无间隔。业务影响：handler 卡死将阻塞整个 tick，重试风暴瞬间耗尽次数。根本原因：定义字段后忽略运行时实现。解决方案：用 `concurrent.futures` 做超时中断，重试循环中加入 `sleep(retry_delay_seconds)`。
-
-触发节点：`resume` 方法。实际行为：周期任务恢复时直接将 `next_run_at` 设为 `now + interval_seconds`，丢弃暂停期间全部应执行周期。业务影响：长时暂停后错失的执行永久丢失，数据同步或结算任务出现遗漏。根本原因：resume 设计只重置时间轴，未考虑补偿语义。解决方案：增加可选的 `catch_up` 参数，启用时循环递增 `next_run_at` 直到超过当前时间。
-
-触发节点：`_execute_single_run` 方法锁外第 743 至 744 行。实际行为：锁内已完成 `info.last_error` 赋值，锁外又进行了一次相同的无锁写入。业务影响：形成线程安全漏洞，未来若改此逻辑将引入数据竞争。根本原因：错误更新逻辑重复写在锁内外两处，锁内一次即可。解决方案：删除锁外的冗余赋值。
-
-触发节点：`trigger` 方法第 340 至 351 行。实际行为：先持锁验证状态后释放锁再执行 handler，状态检查与执行存在竞态窗口。业务影响：任务在窗口期被 cancel 后仍可能产生运行记录，违反业务语义。根本原因：为避阻塞释放了锁但释放范围过大。解决方案：将验证移入 `_execute_single_run` 并在持锁下完成状态快照。
+1. internal_task_runner.py 的 _execute_single_run 方法中，TaskDefinition 的 timeout_seconds 和 retry_delay_seconds 字段设而未用，handler 无超时且重试间无间隔。handler 卡死将阻塞整个 tick，重试风暴瞬间耗尽次数。根本原因是定义字段后忽略运行时实现。应用 concurrent.futures 做超时中断，重试循环中加入 sleep。
+2. internal_task_runner.py 的 resume 方法中，周期任务恢复时直接将 next_run_at 设为 now + interval_seconds，丢弃暂停期间全部应执行周期。长时暂停后错失的执行永久丢失，数据同步或结算任务出现遗漏。根本原因是 resume 设计只重置时间轴，未考虑补偿语义。应增加可选的 catch_up 参数，启用时循环递增 next_run_at 直到超过当前时间。
+3. internal_task_runner.py 的 _execute_single_run 方法中，锁内已完成 info.last_error 赋值，锁外又进行了一次相同的无锁写入。形成线程安全漏洞，未来若改此逻辑将引入数据竞争。根本原因是错误更新逻辑重复写在锁内外两处，锁内一次即可。
+4. internal_task_runner.py 的 trigger 方法中先持锁验证状态后释放锁再执行 handler，状态检查与执行存在竞态窗口。任务在窗口期被 cancel 后仍可能产生运行记录，违反业务语义。根本原因是释放锁范围过大。应将验证移入 _execute_single_run 并在持锁下完成状态快照。
 
 过程不满意：
-
-触发节点：会话记录中首轮 pytest 运行。实际行为：首轮编码后 3 个测试失败，涉及周期任务注册校验时机、多周期 tick 后 next_run_at 更新策略、stats 中 active_tasks 计数。业务影响：暴露模型对调度器状态机边界分析不足，落后多周期行为未经推演就编码。根本原因：未在编码前绘制 tick 调度状态迁移表。解决方案：先明确各任务类型每次 tick 后的状态变化与 next_run_at 更新策略，再编码。
-
-触发节点：测试文件 `_runner_with_history` 和 `test_stats_mixed` 方法。实际行为：测试通过 `runner._tasks["m1"].definition.handler =` 直接操作私有字段替换 handler，绕过公共 API。业务影响：测试与内部实现强耦合，数据结构重构后测试将断裂。根本原因：为细粒度控制放弃封装，未提供公共替换方法。解决方案：增加 `set_task_handler` 方法或重构测试仅用 register 和 trigger。
-
-触发节点：`register` 方法。实际行为：检查 `is_periodic()` 且无 interval 时抛 `InvalidScheduleError`，但 `TaskDefinition` 构造器已对同样条件抛 `ValueError`，此分支永远不可达。业务影响：死代码误导审查者。根本原因：重复校验，构造器总是先于 register 执行。解决方案：删除 register 冗余校验，参数合法性完全委托给 TaskDefinition。
+1. 首轮编码后多个测试失败，涉及周期任务注册校验时机、多周期 tick 后 next_run_at 更新策略、stats 中 active_tasks 计数。暴露模型对调度器状态机边界分析不足，落后多周期行为未经推演就编码。根本原因是未在编码前绘制 tick 调度状态迁移表。
+2. 测试文件 _runner_with_history 和 test_stats_mixed 方法中，测试通过 runner._tasks["m1"].definition.handler = 直接操作私有字段替换 handler，绕过公共 API。测试与内部实现强耦合，数据结构重构后测试将断裂。根本原因为细粒度控制放弃封装，未提供公共替换方法。
+3. internal_task_runner.py 的 register 方法中，检查 is_periodic 且无 interval 时抛 InvalidScheduleError，但 TaskDefinition 构造器已对同样条件抛 ValueError，此分支永远不可达。死代码误导审查者。根本原因是重复校验，构造器总是先于 register 执行。
